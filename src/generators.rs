@@ -48,7 +48,7 @@ pub fn sample_poisson(mean: f64, rng: &mut StdRng) -> usize {
 }
 
 /// Calculate activity multiplier based on time of day, season, and special days
-pub fn diurnal_multiplier(dt: &DateTime<chrono_tz::Tz>, cfg: &Config) -> f64 {
+pub fn diurnal_multiplier(dt: &DateTime<chrono_tz::Tz>, cfg: &Config, day_str: &str) -> f64 {
     let arr = if dt.weekday() == Weekday::Sat || dt.weekday() == Weekday::Sun {
         &cfg.diurnal_weekend
     } else {
@@ -57,8 +57,7 @@ pub fn diurnal_multiplier(dt: &DateTime<chrono_tz::Tz>, cfg: &Config) -> f64 {
 
     let base = arr[dt.hour() as usize];
     let seas = cfg.seasonality.get(&(dt.month() as usize)).unwrap_or(&1.0);
-    let day_str = dt.format("%Y-%m-%d").to_string();
-    let special = cfg.special_days.get(&day_str).unwrap_or(&1.0);
+    let special = cfg.special_days.get(day_str).unwrap_or(&1.0);
 
     base * seas * special
 }
@@ -423,7 +422,7 @@ pub fn worker_generate(
         for _ in 0..10 {
             let offset_secs = rng.gen_range(0..86400);
             let t = day_start_local + Duration::seconds(offset_secs);
-            if rng.gen::<f64>() < diurnal_multiplier(&t, cfg) {
+            if rng.gen::<f64>() < diurnal_multiplier(&t, cfg, &day_str) {
                 return t;
             }
         }
@@ -443,6 +442,13 @@ pub fn worker_generate(
         let c_pool = &c.pool;
         let c_probs = &c.probs;
 
+        // Pre-create contact distribution (CRITICAL OPTIMIZATION!)
+        let contact_dist = if !c_pool.is_empty() {
+            Some(WeightedIndex::new(c_probs).unwrap())
+        } else {
+            None
+        };
+
         // Sample event counts for this user
         let n_calls = sample_poisson(avg_calls, &mut rng);
         let n_sms = sample_poisson(avg_sms, &mut rng);
@@ -453,8 +459,7 @@ pub fn worker_generate(
             let start_local = sample_time(&mut rng);
 
             // Pick counterpart
-            let other_msisdn = if !c_pool.is_empty() {
-                let dist = WeightedIndex::new(c_probs).unwrap();
+            let other_msisdn = if let Some(ref dist) = contact_dist {
                 let other_idx = c_pool[dist.sample(&mut rng)];
                 subs[other_idx].msisdn.clone()
             } else {
@@ -472,8 +477,7 @@ pub fn worker_generate(
         for _ in 0..n_sms {
             let start_local = sample_time(&mut rng);
 
-            let other_msisdn = if !c_pool.is_empty() {
-                let dist = WeightedIndex::new(c_probs).unwrap();
+            let other_msisdn = if let Some(ref dist) = contact_dist {
                 let other_idx = c_pool[dist.sample(&mut rng)];
                 subs[other_idx].msisdn.clone()
             } else {

@@ -52,3 +52,10 @@ tempfile = "3.8"
 [[bin]]
 name = "rs_cdr_generator"
 path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
