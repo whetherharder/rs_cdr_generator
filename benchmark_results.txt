@@ -1,0 +1,29 @@
+CDR Generator Benchmark Results
+Generated: Sat Oct 25 23:07:04 MSK 2025
+Host: Darwin uzum-vfomintsev-msk.local 24.6.0 Darwin Kernel Version 24.6.0: Mon Jul 14 11:28:17 PDT 2025; root:xnu-11417.140.69~1/RELEASE_X86_64 x86_64
+CPUs: 12
+
+[Small dataset]
+  Subscribers: 1000
+  Days: 1
+  Elapsed time: .055854000s
+  Throughput: 17903 subs/sec
+
+[Medium dataset]
+  Subscribers: 10000
+  Days: 1
+  Elapsed time: .229287000s
+  Throughput: 43613 subs/sec
+
+[Large dataset]
+  Subscribers: 50000
+  Days: 1
+  Elapsed time: 1.765440000s
+  Throughput: 28321 subs/sec
+
+[Very large dataset]
+  Subscribers: 100000
+  Days: 1
+  Elapsed time: 8.210220000s
+  Throughput: 12179 subs/sec
+
