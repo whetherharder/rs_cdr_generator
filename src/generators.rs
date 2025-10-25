@@ -67,7 +67,7 @@ pub fn diurnal_multiplier(dt: &DateTime<chrono_tz::Tz>, cfg: &Config) -> f64 {
 pub struct CallGenerator {
     p_mo: f64,
     dispo_pop: Vec<String>,
-    dispo_wts: Vec<f64>,
+    dispo_dist: WeightedIndex<f64>,
     mu: f64,
     sigma: f64,
 }
@@ -82,6 +82,8 @@ impl CallGenerator {
             .map(|k| *cfg.call_dispositions.get(k).unwrap())
             .collect();
 
+        let dispo_dist = WeightedIndex::new(&dispo_wts).unwrap();
+
         let (mu, sigma) = lognorm_params_from_quantiles(
             cfg.call_duration_quantiles.p50 as f64,
             cfg.call_duration_quantiles.p90 as f64,
@@ -90,7 +92,7 @@ impl CallGenerator {
         CallGenerator {
             p_mo,
             dispo_pop,
-            dispo_wts,
+            dispo_dist,
             mu,
             sigma,
         }
@@ -117,8 +119,7 @@ impl CallGenerator {
             (other_msisdn.to_string(), sub.msisdn.clone())
         };
 
-        let dist = WeightedIndex::new(&self.dispo_wts).unwrap();
-        let dispo = &self.dispo_pop[dist.sample(rng)];
+        let dispo = &self.dispo_pop[self.dispo_dist.sample(rng)];
 
         let (dur_sec, cause) = match dispo.as_str() {
             "ANSWERED" => {
@@ -173,12 +174,22 @@ impl CallGenerator {
 /// Generate SMS events
 pub struct SmsGenerator {
     p_mo: f64,
+    status_dist: WeightedIndex<f64>,
+    segments_dist: WeightedIndex<f64>,
 }
 
 impl SmsGenerator {
     pub fn new(cfg: &Config) -> Self {
+        let status_weights = [0.1, 0.88, 0.02];
+        let status_dist = WeightedIndex::new(&status_weights).unwrap();
+
+        let segments_weights = [0.85, 0.13, 0.02];
+        let segments_dist = WeightedIndex::new(&segments_weights).unwrap();
+
         SmsGenerator {
             p_mo: cfg.mo_share_sms,
+            status_dist,
+            segments_dist,
         }
     }
 
@@ -214,9 +225,7 @@ impl SmsGenerator {
         let dur = rng.gen_range(1..=5);
         let end_local = start_local + Duration::seconds(dur);
 
-        let status_weights = [0.1, 0.88, 0.02];
-        let dist = WeightedIndex::new(&status_weights).unwrap();
-        let sms_status = match dist.sample(rng) {
+        let sms_status = match self.status_dist.sample(rng) {
             0 => "SENT",
             1 => "DELIVERED",
             _ => "FAILED",
@@ -228,9 +237,7 @@ impl SmsGenerator {
             "deliverySuccess"
         };
 
-        let segments_weights = [0.85, 0.13, 0.02];
-        let seg_dist = WeightedIndex::new(&segments_weights).unwrap();
-        let sms_segments = match seg_dist.sample(rng) {
+        let sms_segments = match self.segments_dist.sample(rng) {
             0 => 1,
             1 => 2,
             _ => 3,
@@ -267,13 +274,23 @@ impl SmsGenerator {
 pub struct DataGenerator {
     cells_by_rat: HashMap<String, Vec<u32>>,
     cells_all: Vec<u32>,
+    rat_dist: WeightedIndex<f64>,
+    apn_dist: WeightedIndex<f64>,
 }
 
 impl DataGenerator {
     pub fn new(cells_by_rat: HashMap<String, Vec<u32>>, cells_all: Vec<u32>) -> Self {
+        let rat_weights = [0.3, 0.5, 0.2];
+        let rat_dist = WeightedIndex::new(&rat_weights).unwrap();
+
+        let apn_weights = [0.8, 0.1, 0.1];
+        let apn_dist = WeightedIndex::new(&apn_weights).unwrap();
+
         DataGenerator {
             cells_by_rat,
             cells_all,
+            rat_dist,
+            apn_dist,
         }
     }
 
@@ -284,9 +301,7 @@ impl DataGenerator {
         tz_name: &str,
         rng: &mut StdRng,
     ) -> EventRow {
-        let rat_weights = [0.3, 0.5, 0.2];
-        let rat_dist = WeightedIndex::new(&rat_weights).unwrap();
-        let rat = match rat_dist.sample(rng) {
+        let rat = match self.rat_dist.sample(rng) {
             0 => "WCDMA",
             1 => "LTE",
             _ => "NR",
@@ -307,9 +322,7 @@ impl DataGenerator {
         let up = (down as f64 * rng.gen_range(up_ratio_min..=up_ratio_max))
             .max(1_000.0) as u64;
 
-        let apn_weights = [0.8, 0.1, 0.1];
-        let apn_dist = WeightedIndex::new(&apn_weights).unwrap();
-        let apn = match apn_dist.sample(rng) {
+        let apn = match self.apn_dist.sample(rng) {
             0 => "internet",
             1 => "ims",
             _ => "mms",

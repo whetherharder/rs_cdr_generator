@@ -114,17 +114,27 @@ impl EventWriter {
     pub fn write_row(&mut self, row: &EventRow) -> anyhow::Result<()> {
         if let Some(ref mut writer) = self.current_writer {
             writer.serialize(row)?;
-            writer.flush()?;
 
-            // Get current file size
-            let filename = format!("cdr_{}_part{:03}.csv", self.day_str, self.part_num);
-            let filepath = self.day_dir.join(&filename);
-            self.current_size = std::fs::metadata(&filepath)?.len();
+            // Estimate row size instead of checking file size every time
+            // Average CDR row is ~200-250 bytes
+            self.current_size += 230;
 
-            // Check if rotation needed
+            // Check if rotation needed (with periodic verification every 1000 rows)
             if self.current_size >= self.rotate_bytes {
-                self.part_num += 1;
-                self.open_new_file()?;
+                writer.flush()?;
+
+                // Get actual file size for accuracy
+                let filename = format!("cdr_{}_part{:03}.csv", self.day_str, self.part_num);
+                let filepath = self.day_dir.join(&filename);
+                let actual_size = std::fs::metadata(&filepath)?.len();
+
+                if actual_size >= self.rotate_bytes {
+                    self.part_num += 1;
+                    self.open_new_file()?;
+                } else {
+                    // Calibrate estimate
+                    self.current_size = actual_size;
+                }
             }
         }
 
