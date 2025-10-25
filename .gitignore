@@ -1,0 +1,25 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Output
+out/
+*.tar.gz
+*.csv
+*.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+tmp/
+temp/

@@ -1,0 +1,496 @@
+// Event generation logic for CALL, SMS, and DATA events
+use crate::config::Config;
+use crate::identity::{build_contacts, build_subscribers, gen_imei, Subscriber};
+use crate::timezone_utils::{to_epoch_ms, tz_from_name, tz_offset_minutes};
+use crate::writer::{EventRow, EventWriter};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Weekday};
+use rand::distributions::WeightedIndex;
+use rand::prelude::*;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use rand_distr::{Distribution, LogNormal, Normal};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
+
+/// Calculate lognormal mu and sigma from quantiles
+pub fn lognorm_params_from_quantiles(p50: f64, p90: f64) -> (f64, f64) {
+    let mu = p50.max(1.0).ln();
+    let sigma = (p90.max(1.0) / p50.max(1.0)).ln() / 1.2815515655446004;
+    let sigma = sigma.max(0.2).min(2.0);
+    (mu, sigma)
+}
+
+/// Sample call duration from lognormal distribution
+pub fn sample_call_duration(rng: &mut StdRng, mu: f64, sigma: f64) -> i64 {
+    let log_normal = LogNormal::new(mu, sigma).unwrap();
+    log_normal.sample(rng).max(1.0) as i64
+}
+
+/// Sample from Poisson distribution
+pub fn sample_poisson(mean: f64, rng: &mut StdRng) -> usize {
+    if mean <= 0.0 {
+        return 0;
+    }
+    if mean < 30.0 {
+        let l = (-mean).exp();
+        let mut k: usize = 0;
+        let mut p = 1.0;
+        while p > l {
+            k += 1;
+            p *= rng.gen::<f64>();
+        }
+        k.saturating_sub(1)
+    } else {
+        let normal = Normal::new(mean, mean.sqrt()).unwrap();
+        normal.sample(rng).max(0.0) as usize
+    }
+}
+
+/// Calculate activity multiplier based on time of day, season, and special days
+pub fn diurnal_multiplier(dt: &DateTime<chrono_tz::Tz>, cfg: &Config) -> f64 {
+    let arr = if dt.weekday() == Weekday::Sat || dt.weekday() == Weekday::Sun {
+        &cfg.diurnal_weekend
+    } else {
+        &cfg.diurnal_weekday
+    };
+
+    let base = arr[dt.hour() as usize];
+    let seas = cfg.seasonality.get(&(dt.month() as usize)).unwrap_or(&1.0);
+    let day_str = dt.format("%Y-%m-%d").to_string();
+    let special = cfg.special_days.get(&day_str).unwrap_or(&1.0);
+
+    base * seas * special
+}
+
+/// Generate CALL events
+pub struct CallGenerator {
+    p_mo: f64,
+    dispo_pop: Vec<String>,
+    dispo_wts: Vec<f64>,
+    mu: f64,
+    sigma: f64,
+}
+
+impl CallGenerator {
+    pub fn new(cfg: &Config) -> Self {
+        let p_mo = cfg.mo_share_call;
+
+        let dispo_pop: Vec<String> = cfg.call_dispositions.keys().cloned().collect();
+        let dispo_wts: Vec<f64> = dispo_pop
+            .iter()
+            .map(|k| *cfg.call_dispositions.get(k).unwrap())
+            .collect();
+
+        let (mu, sigma) = lognorm_params_from_quantiles(
+            cfg.call_duration_quantiles.p50 as f64,
+            cfg.call_duration_quantiles.p90 as f64,
+        );
+
+        CallGenerator {
+            p_mo,
+            dispo_pop,
+            dispo_wts,
+            mu,
+            sigma,
+        }
+    }
+
+    pub fn generate(
+        &self,
+        sub: &Subscriber,
+        start_local: DateTime<chrono_tz::Tz>,
+        other_msisdn: &str,
+        tz_name: &str,
+        cell_id: u32,
+        rng: &mut StdRng,
+    ) -> EventRow {
+        let direction = if rng.gen::<f64>() < self.p_mo {
+            "MO"
+        } else {
+            "MT"
+        };
+
+        let (msisdn_src, msisdn_dst) = if direction == "MO" {
+            (sub.msisdn.clone(), other_msisdn.to_string())
+        } else {
+            (other_msisdn.to_string(), sub.msisdn.clone())
+        };
+
+        let dist = WeightedIndex::new(&self.dispo_wts).unwrap();
+        let dispo = &self.dispo_pop[dist.sample(rng)];
+
+        let (dur_sec, cause) = match dispo.as_str() {
+            "ANSWERED" => {
+                let ring = rng.gen_range(2..=25);
+                let dur = sample_call_duration(rng, self.mu, self.sigma);
+                (ring + dur, "normalRelease")
+            }
+            "NO ANSWER" => {
+                let dur = rng.gen_range(5..=30);
+                (dur, "noAnswer")
+            }
+            "BUSY" => {
+                let dur = rng.gen_range(2..=10);
+                (dur, "busy")
+            }
+            _ => {
+                // FAILED or CONGESTION
+                let dur = rng.gen_range(1..=5);
+                (dur, "failure")
+            }
+        };
+
+        let end_local = start_local + Duration::seconds(dur_sec);
+
+        EventRow {
+            event_type: "CALL".to_string(),
+            msisdn_src,
+            msisdn_dst,
+            direction: direction.to_string(),
+            start_ts_ms: to_epoch_ms(&start_local.with_timezone(&chrono::Utc)),
+            end_ts_ms: to_epoch_ms(&end_local.with_timezone(&chrono::Utc)),
+            tz_name: tz_name.to_string(),
+            tz_offset_min: tz_offset_minutes(&start_local),
+            duration_sec: dur_sec,
+            mccmnc: sub.mccmnc.clone(),
+            imsi: sub.imsi.clone(),
+            imei: sub.imei.clone(),
+            cell_id,
+            record_type: "mscVoiceRecord".to_string(),
+            cause_for_record_closing: cause.to_string(),
+            sms_segments: String::new(),
+            sms_status: String::new(),
+            data_bytes_in: String::new(),
+            data_bytes_out: String::new(),
+            data_duration_sec: String::new(),
+            apn: String::new(),
+            rat: String::new(),
+        }
+    }
+}
+
+/// Generate SMS events
+pub struct SmsGenerator {
+    p_mo: f64,
+}
+
+impl SmsGenerator {
+    pub fn new(cfg: &Config) -> Self {
+        SmsGenerator {
+            p_mo: cfg.mo_share_sms,
+        }
+    }
+
+    pub fn generate(
+        &self,
+        sub: &Subscriber,
+        start_local: DateTime<chrono_tz::Tz>,
+        other_msisdn: &str,
+        tz_name: &str,
+        cell_id: u32,
+        rng: &mut StdRng,
+    ) -> EventRow {
+        let direction = if rng.gen::<f64>() < self.p_mo {
+            "MO"
+        } else {
+            "MT"
+        };
+
+        let (msisdn_src, msisdn_dst, record_type) = if direction == "MO" {
+            (
+                sub.msisdn.clone(),
+                other_msisdn.to_string(),
+                "sgsnSMORecord",
+            )
+        } else {
+            (
+                other_msisdn.to_string(),
+                sub.msisdn.clone(),
+                "sgsnSMTRecord",
+            )
+        };
+
+        let dur = rng.gen_range(1..=5);
+        let end_local = start_local + Duration::seconds(dur);
+
+        let status_weights = [0.1, 0.88, 0.02];
+        let dist = WeightedIndex::new(&status_weights).unwrap();
+        let sms_status = match dist.sample(rng) {
+            0 => "SENT",
+            1 => "DELIVERED",
+            _ => "FAILED",
+        };
+
+        let cause = if sms_status == "FAILED" {
+            "deliveryFailure"
+        } else {
+            "deliverySuccess"
+        };
+
+        let segments_weights = [0.85, 0.13, 0.02];
+        let seg_dist = WeightedIndex::new(&segments_weights).unwrap();
+        let sms_segments = match seg_dist.sample(rng) {
+            0 => 1,
+            1 => 2,
+            _ => 3,
+        };
+
+        EventRow {
+            event_type: "SMS".to_string(),
+            msisdn_src,
+            msisdn_dst,
+            direction: direction.to_string(),
+            start_ts_ms: to_epoch_ms(&start_local.with_timezone(&chrono::Utc)),
+            end_ts_ms: to_epoch_ms(&end_local.with_timezone(&chrono::Utc)),
+            tz_name: tz_name.to_string(),
+            tz_offset_min: tz_offset_minutes(&start_local),
+            duration_sec: dur,
+            mccmnc: sub.mccmnc.clone(),
+            imsi: sub.imsi.clone(),
+            imei: sub.imei.clone(),
+            cell_id,
+            record_type: record_type.to_string(),
+            cause_for_record_closing: cause.to_string(),
+            sms_segments: sms_segments.to_string(),
+            sms_status: sms_status.to_string(),
+            data_bytes_in: String::new(),
+            data_bytes_out: String::new(),
+            data_duration_sec: String::new(),
+            apn: String::new(),
+            rat: String::new(),
+        }
+    }
+}
+
+/// Generate DATA session events
+pub struct DataGenerator {
+    cells_by_rat: HashMap<String, Vec<u32>>,
+    cells_all: Vec<u32>,
+}
+
+impl DataGenerator {
+    pub fn new(cells_by_rat: HashMap<String, Vec<u32>>, cells_all: Vec<u32>) -> Self {
+        DataGenerator {
+            cells_by_rat,
+            cells_all,
+        }
+    }
+
+    pub fn generate(
+        &self,
+        sub: &Subscriber,
+        start_local: DateTime<chrono_tz::Tz>,
+        tz_name: &str,
+        rng: &mut StdRng,
+    ) -> EventRow {
+        let rat_weights = [0.3, 0.5, 0.2];
+        let rat_dist = WeightedIndex::new(&rat_weights).unwrap();
+        let rat = match rat_dist.sample(rng) {
+            0 => "WCDMA",
+            1 => "LTE",
+            _ => "NR",
+        };
+
+        let (down_mean, down_sd, up_ratio_min, up_ratio_max, dur_mean, dur_sd) = match rat {
+            "LTE" => (4_000_000.0, 2_000_000.0, 0.1, 0.3, 300.0, 180.0),
+            "NR" => (12_000_000.0, 8_000_000.0, 0.1, 0.35, 240.0, 180.0),
+            _ => (1_000_000.0, 600_000.0, 0.08, 0.25, 420.0, 240.0),
+        };
+
+        let dur_normal = Normal::new(dur_mean, dur_sd).unwrap();
+        let dur = (dur_normal.sample(rng) as f64).abs().max(5.0) as i64;
+        let end_local = start_local + Duration::seconds(dur);
+
+        let down_normal = Normal::new(down_mean, down_sd).unwrap();
+        let down = (down_normal.sample(rng) as f64).abs().max(2_000.0) as u64;
+        let up = (down as f64 * rng.gen_range(up_ratio_min..=up_ratio_max))
+            .max(1_000.0) as u64;
+
+        let apn_weights = [0.8, 0.1, 0.1];
+        let apn_dist = WeightedIndex::new(&apn_weights).unwrap();
+        let apn = match apn_dist.sample(rng) {
+            0 => "internet",
+            1 => "ims",
+            _ => "mms",
+        };
+
+        let candidates = self.cells_by_rat.get(rat).unwrap_or(&self.cells_all);
+        let cell_id = if !candidates.is_empty() {
+            candidates[rng.gen_range(0..candidates.len())]
+        } else {
+            rng.gen_range(10_000..100_000)
+        };
+
+        let record_types = ["sgsnPDPRecord", "pgwRecord"];
+        let record_type = record_types[rng.gen_range(0..record_types.len())];
+
+        EventRow {
+            event_type: "DATA".to_string(),
+            msisdn_src: sub.msisdn.clone(),
+            msisdn_dst: String::new(),
+            direction: "MO".to_string(),
+            start_ts_ms: to_epoch_ms(&start_local.with_timezone(&chrono::Utc)),
+            end_ts_ms: to_epoch_ms(&end_local.with_timezone(&chrono::Utc)),
+            tz_name: tz_name.to_string(),
+            tz_offset_min: tz_offset_minutes(&start_local),
+            duration_sec: dur,
+            mccmnc: sub.mccmnc.clone(),
+            imsi: sub.imsi.clone(),
+            imei: sub.imei.clone(),
+            cell_id,
+            record_type: record_type.to_string(),
+            cause_for_record_closing: "normalRelease".to_string(),
+            sms_segments: String::new(),
+            sms_status: String::new(),
+            data_bytes_in: up.to_string(),
+            data_bytes_out: down.to_string(),
+            data_duration_sec: dur.to_string(),
+            apn: apn.to_string(),
+            rat: rat.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ShardStats {
+    pub shard: usize,
+    pub calls: usize,
+    pub sms: usize,
+    pub data: usize,
+}
+
+/// Worker process that generates events for a shard of users
+pub fn worker_generate(
+    day: DateTime<chrono_tz::Tz>,
+    shard_id: usize,
+    users_range: (usize, usize),
+    cfg: &Config,
+    out_dir: &Path,
+) -> anyhow::Result<()> {
+    let seed = (cfg.workers as u64).wrapping_mul(1000) + shard_id as u64;
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let tz = tz_from_name(&cfg.tz_name);
+    let tz_name = &cfg.tz_name;
+
+    // Build contacts & subscribers for this shard
+    let (start_u, end_u) = users_range;
+    let shard_pop = end_u - start_u;
+
+    let contacts = build_contacts(shard_pop, 30, &mut rng);
+    let subs = build_subscribers(shard_pop, &cfg.prefixes, &cfg.mccmnc_pool, &mut rng);
+
+    // Event counts per user
+    let avg_calls = cfg.avg_calls_per_user;
+    let avg_sms = cfg.avg_sms_per_user;
+    let avg_data = cfg.avg_data_sessions_per_user;
+
+    // Initialize generators
+    let call_gen = CallGenerator::new(cfg);
+    let sms_gen = SmsGenerator::new(cfg);
+    let data_gen = DataGenerator::new(HashMap::new(), vec![]);
+
+    let day_str = day.format("%Y-%m-%d").to_string();
+    let mut writer = EventWriter::new(out_dir, &day_str, cfg.rotate_bytes)?;
+
+    let day_start_local = tz
+        .with_ymd_and_hms(day.year(), day.month(), day.day(), 0, 0, 0)
+        .unwrap();
+
+    let mut stats = ShardStats {
+        shard: shard_id,
+        calls: 0,
+        sms: 0,
+        data: 0,
+    };
+
+    // Helper: sample time during the day with diurnal pattern
+    let sample_time = |rng: &mut StdRng| -> DateTime<chrono_tz::Tz> {
+        for _ in 0..10 {
+            let offset_secs = rng.gen_range(0..86400);
+            let t = day_start_local + Duration::seconds(offset_secs);
+            if rng.gen::<f64>() < diurnal_multiplier(&t, cfg) {
+                return t;
+            }
+        }
+        let offset_secs = rng.gen_range(0..86400);
+        day_start_local + Duration::seconds(offset_secs)
+    };
+
+    for uidx in 0..shard_pop {
+        let mut sub = subs[uidx].clone();
+
+        // Occasional IMEI change (new device)
+        if rng.gen::<f64>() < cfg.imei_daily_change_prob {
+            sub.imei = gen_imei(&mut rng);
+        }
+
+        let c = &contacts[uidx];
+        let c_pool = &c.pool;
+        let c_probs = &c.probs;
+
+        // Sample event counts for this user
+        let n_calls = sample_poisson(avg_calls, &mut rng);
+        let n_sms = sample_poisson(avg_sms, &mut rng);
+        let n_data = sample_poisson(avg_data, &mut rng);
+
+        // Generate CALL events
+        for _ in 0..n_calls {
+            let start_local = sample_time(&mut rng);
+
+            // Pick counterpart
+            let other_msisdn = if !c_pool.is_empty() {
+                let dist = WeightedIndex::new(c_probs).unwrap();
+                let other_idx = c_pool[dist.sample(&mut rng)];
+                subs[other_idx].msisdn.clone()
+            } else {
+                let prefix = &cfg.prefixes[rng.gen_range(0..cfg.prefixes.len())];
+                format!("{}{:07}", prefix, rng.gen_range(0..10_000_000))
+            };
+
+            let cell_id = rng.gen_range(10_000..100_000);
+            let row = call_gen.generate(&sub, start_local, &other_msisdn, tz_name, cell_id, &mut rng);
+            writer.write_row(&row)?;
+            stats.calls += 1;
+        }
+
+        // Generate SMS events
+        for _ in 0..n_sms {
+            let start_local = sample_time(&mut rng);
+
+            let other_msisdn = if !c_pool.is_empty() {
+                let dist = WeightedIndex::new(c_probs).unwrap();
+                let other_idx = c_pool[dist.sample(&mut rng)];
+                subs[other_idx].msisdn.clone()
+            } else {
+                let prefix = &cfg.prefixes[rng.gen_range(0..cfg.prefixes.len())];
+                format!("{}{:07}", prefix, rng.gen_range(0..10_000_000))
+            };
+
+            let cell_id = rng.gen_range(10_000..100_000);
+            let row = sms_gen.generate(&sub, start_local, &other_msisdn, tz_name, cell_id, &mut rng);
+            writer.write_row(&row)?;
+            stats.sms += 1;
+        }
+
+        // Generate DATA sessions
+        for _ in 0..n_data {
+            let start_local = sample_time(&mut rng);
+            let row = data_gen.generate(&sub, start_local, tz_name, &mut rng);
+            writer.write_row(&row)?;
+            stats.data += 1;
+        }
+    }
+
+    writer.close()?;
+
+    // Write stats
+    let stat_path = out_dir
+        .join(&day_str)
+        .join(format!("stats_shard{:03}.json", shard_id));
+    let stats_json = serde_json::to_string_pretty(&stats)?;
+    std::fs::write(stat_path, stats_json)?;
+
+    Ok(())
+}
