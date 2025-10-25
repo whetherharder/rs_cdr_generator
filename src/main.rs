@@ -88,6 +88,10 @@ struct Args {
     /// Вероятность смены IMEI в день [0..1]
     #[arg(long)]
     imei_change_prob: Option<f64>,
+
+    /// Удалять исходные файлы после архивации
+    #[arg(long, default_value = "false")]
+    cleanup_after_archive: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -210,7 +214,7 @@ fn main() -> anyhow::Result<()> {
 
         // Create summary and bundle
         create_daily_summary(&args.out, &day)?;
-        let tarfile_path = bundle_day(&args.out, &day)?;
+        let tarfile_path = bundle_day(&args.out, &day, args.cleanup_after_archive)?;
 
         println!("Day {} done → {:?}", day_str, tarfile_path);
     }

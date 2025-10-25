@@ -66,7 +66,7 @@ pub fn create_daily_summary(out_dir: &Path, day: &DateTime<Tz>) -> anyhow::Resul
 }
 
 /// Create a TAR.GZ archive for a day's worth of CDR data
-pub fn bundle_day(out_dir: &Path, day: &DateTime<Tz>) -> anyhow::Result<PathBuf> {
+pub fn bundle_day(out_dir: &Path, day: &DateTime<Tz>, cleanup: bool) -> anyhow::Result<PathBuf> {
     let day_str = day.format("%Y-%m-%d").to_string();
     let day_dir = out_dir.join(&day_str);
 
@@ -85,6 +85,13 @@ pub fn bundle_day(out_dir: &Path, day: &DateTime<Tz>) -> anyhow::Result<PathBuf>
     tar.finish()?;
 
     println!("Created archive: {:?}", archive_path);
+
+    // Cleanup original files if requested
+    if cleanup {
+        std::fs::remove_dir_all(&day_dir)?;
+        println!("Cleaned up directory: {:?}", day_dir);
+    }
+
     Ok(archive_path)
 }
 
@@ -132,8 +139,27 @@ mod tests {
         // Create a dummy file
         fs::write(day_dir.join("test.txt"), "test content").unwrap();
 
-        let archive_path = bundle_day(dir.path(), &day).unwrap();
+        let archive_path = bundle_day(dir.path(), &day, false).unwrap();
         assert!(archive_path.exists());
         assert!(archive_path.to_string_lossy().ends_with(".tar.gz"));
+        assert!(day_dir.exists()); // Should still exist when cleanup=false
+    }
+
+    #[test]
+    fn test_bundle_day_with_cleanup() {
+        let dir = tempdir().unwrap();
+        let day = chrono_tz::Europe::Amsterdam
+            .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
+            .unwrap();
+        let day_str = day.format("%Y-%m-%d").to_string();
+        let day_dir = dir.path().join(&day_str);
+        fs::create_dir_all(&day_dir).unwrap();
+
+        // Create a dummy file
+        fs::write(day_dir.join("test.txt"), "test content").unwrap();
+
+        let archive_path = bundle_day(dir.path(), &day, true).unwrap();
+        assert!(archive_path.exists());
+        assert!(!day_dir.exists()); // Should be deleted when cleanup=true
     }
 }

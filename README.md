@@ -93,6 +93,7 @@ Generate 100,000 subscribers for 1 day:
 | `--mo-share-call` | MO probability for calls [0..1] | 0.5 |
 | `--mo-share-sms` | MO probability for SMS [0..1] | 0.5 |
 | `--imei-change-prob` | Daily IMEI change probability [0..1] | 0.02 |
+| `--cleanup-after-archive` | Delete source files after archiving | false |
 
 ## Output Structure
 
