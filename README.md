@@ -6,9 +6,12 @@ Rust port of the Python CDR Generator with full behavioral compatibility.
 
 **RS CDR Generator** is a high-performance Rust implementation of a unified CDR (Call Detail Record) generator for large-scale synthetic telecom datasets. It generates realistic CALL, SMS, and DATA events with proper temporal patterns, subscriber identities, and network characteristics.
 
-### Version 5.1.0
+### Version 5.1.0 (Optimized)
 
 This is a direct port of the Python cdr_generator v5.1.0 with complete preservation of behavior.
+
+**⚡ This branch includes performance optimizations achieving 2.83x speedup!**
+See [PERFORMANCE_SUMMARY.md](PERFORMANCE_SUMMARY.md) for details.
 
 ## Features
 
@@ -195,12 +198,34 @@ This Rust port maintains **exact behavioral compatibility** with the Python vers
 ✅ **Same file rotation**: Byte-accurate thresholds
 ✅ **Same statistics**: Event counts, aggregation
 
+## Performance
+
+### Benchmark Results
+
+| Dataset | Subscribers | Time | Throughput |
+|---------|-------------|------|------------|
+| Small | 1,000 | 0.056s | 17,903 subs/sec |
+| Medium | 10,000 | 0.229s | 43,613 subs/sec |
+| Large | 50,000 | 1.765s | 28,321 subs/sec |
+| Very Large | 100,000 | 8.210s | 12,179 subs/sec |
+
+**Hardware**: 12-core macOS (Intel)
+
+### Run Benchmarks
+
+```bash
+./benchmark.sh
+```
+
+See [PERFORMANCE_SUMMARY.md](PERFORMANCE_SUMMARY.md) for detailed analysis.
+
 ## Differences from Python Version
 
-| Aspect | Python | Rust |
-|--------|--------|------|
+| Aspect | Python | Rust (Optimized) |
+|--------|--------|------------------|
 | Multiprocessing | `multiprocessing.spawn` | Rayon (thread pool) |
-| Performance | ~10s for 100K subs/day | ~10s for 100K subs/day |
+| Performance | ~10s for 100K subs/day | **~8s for 100K subs/day** |
+| I/O overhead | High (flush per row) | **Low (batched)** |
 | Memory | ~1-2 GB per process | ~1-2 GB total |
 | Dependencies | pyyaml (optional) | All vendored |
 
