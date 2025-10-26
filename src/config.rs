@@ -58,6 +58,11 @@ pub struct Config {
     // Multiprocessing
     pub workers: usize,
 
+    // Performance optimization settings
+    pub event_pool_size: usize,      // EventRow object pool size per worker
+    pub batch_size_bytes: usize,     // Batch size for async writing (bytes)
+    pub writer_tasks: usize,         // Number of async writer tasks (0 = auto)
+
     // Subscriber database
     pub subscriber_db_path: Option<PathBuf>,
     pub generate_subscriber_db: Option<PathBuf>,
@@ -146,6 +151,9 @@ impl Default for Config {
             rotate_bytes: 100_000_000,
             tz_name: DEFAULT_TZ_NAME.to_string(),
             workers: 0,
+            event_pool_size: 10_000,           // 10K EventRow objects per worker
+            batch_size_bytes: 10_485_760,      // 10MB batch size
+            writer_tasks: 0,                   // Auto-detect (workers / 2)
             subscriber_db_path: None,
             generate_subscriber_db: None,
             db_size: 10_000,
@@ -284,6 +292,21 @@ fn merge_config_value(config: &mut Config, key: &str, value: serde_yaml::Value) 
         "workers" => {
             if let Some(v) = value.as_u64() {
                 config.workers = v as usize;
+            }
+        }
+        "event_pool_size" => {
+            if let Some(v) = value.as_u64() {
+                config.event_pool_size = v as usize;
+            }
+        }
+        "batch_size_bytes" => {
+            if let Some(v) = value.as_u64() {
+                config.batch_size_bytes = v as usize;
+            }
+        }
+        "writer_tasks" => {
+            if let Some(v) = value.as_u64() {
+                config.writer_tasks = v as usize;
             }
         }
         "rotate_bytes" => {
