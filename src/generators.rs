@@ -361,11 +361,44 @@ pub fn worker_generate(
     users_range: (usize, usize),
     cfg: &Config,
     out_dir: &Path,
-    subscriber_db: Option<&SubscriberDatabase>,
+    subscriber_db_path: Option<&Path>,
     writer_tx: Sender<WriterMessage>,
 ) -> anyhow::Result<()> {
+    use chrono::Duration;
+
     let seed = (cfg.workers as u64).wrapping_mul(1000) + shard_id as u64;
     let mut rng = StdRng::seed_from_u64(seed);
+
+    // Load and filter subscriber database for this worker's subscriber range
+    let subscriber_db = if let Some(db_path) = subscriber_db_path {
+        let (start_u, end_u) = users_range;
+
+        // Load events from start of history to end of generation day
+        let day_end_ts = (day + Duration::days(1)).timestamp_millis();
+
+        // Memory-efficient loading: filter during read, not after
+        let mut filtered_db = if db_path.extension().and_then(|s| s.to_str()) == Some("arrow") {
+            SubscriberDatabase::load_from_arrow_with_msisdn_filter(
+                db_path,
+                0,
+                day_end_ts,
+                start_u,
+                end_u,
+                &cfg.prefixes,
+            )?
+        } else {
+            // CSV fallback: still need to load all then filter
+            let full_db = SubscriberDatabase::load_from_csv(db_path)?;
+            full_db.filter_by_msisdn_range(start_u, end_u, &cfg.prefixes)
+        };
+
+        // Build snapshots for fast lookup
+        filtered_db.build_snapshots();
+
+        Some(filtered_db)
+    } else {
+        None
+    };
 
     let tz = tz_from_name(&cfg.tz_name);
     // Convert to 'static str for zero-copy EventRow usage
@@ -379,15 +412,38 @@ pub fn worker_generate(
     let contacts = build_contacts(shard_pop, 30, &mut rng);
 
     // Use subscriber database if provided, otherwise generate random subscribers
-    let subs = if let Some(_db) = subscriber_db {
-        // When using subscriber DB, we'll generate a placeholder list
-        // The actual subscriber data will be fetched dynamically per event
-        vec![Subscriber {
+    let subs = if let Some(ref db) = subscriber_db {
+        // Pre-allocate subscribers array
+        let mut subscribers = vec![Subscriber {
             msisdn: 0,
             imsi: 0,
             mccmnc: 0,
             imei: 0,
-        }; shard_pop]
+        }; shard_pop];
+
+        // Fill from database snapshots
+        let day_start_ts = day.timestamp_millis();
+
+        for uidx in 0..shard_pop {
+            let sub_idx = start_u + uidx;
+
+            // Generate MSISDN for this subscriber
+            let prefix = &cfg.prefixes[sub_idx % cfg.prefixes.len()];
+            let number = sub_idx % 10_000_000;
+            let msisdn_str = format!("{}{:07}", prefix, number);
+
+            // Get snapshot from database
+            if let Some(snapshot) = db.get_snapshot_by_msisdn(&msisdn_str, day_start_ts) {
+                subscribers[uidx] = Subscriber {
+                    msisdn: snapshot.msisdn.parse::<u64>().unwrap_or(0),
+                    imsi: snapshot.imsi.parse::<u64>().unwrap_or(0),
+                    imei: snapshot.imei.parse::<u64>().unwrap_or(0),
+                    mccmnc: snapshot.mccmnc.parse::<u32>().unwrap_or(0),
+                };
+            }
+        }
+
+        subscribers
     } else {
         build_subscribers(shard_pop, &cfg.prefixes, &cfg.mccmnc_pool, &mut rng)
     };
@@ -435,29 +491,6 @@ pub fn worker_generate(
         day_start_local + Duration::seconds(offset_secs)
     };
 
-    // Build IMSI list for this shard if using subscriber DB
-    let imsi_list: Vec<String> = if let Some(db) = subscriber_db {
-        // Get unique IMSIs from database and distribute across shards
-        let all_imsis: Vec<String> = db.get_all_unique_imsi();
-        let total_imsis = all_imsis.len();
-
-        if total_imsis == 0 {
-            eprintln!("Warning: No IMSIs found in subscriber database");
-            Vec::with_capacity(0)
-        } else {
-            // Distribute IMSIs across shards with pre-allocation
-            let mut list = Vec::with_capacity(shard_pop);
-            list.extend(
-                all_imsis.into_iter()
-                    .skip(start_u % total_imsis)
-                    .take(shard_pop)
-            );
-            list
-        }
-    } else {
-        Vec::with_capacity(0)
-    };
-
     // Parse prefixes to u64 for numeric operations
     let numeric_prefixes: Vec<u64> = cfg.prefixes
         .iter()
@@ -465,19 +498,18 @@ pub fn worker_generate(
         .collect();
 
     for uidx in 0..shard_pop {
-        // Get subscriber info - either from DB snapshot or generated subscriber
-        let mut sub = if subscriber_db.is_some() {
-            // TODO: Full subscriber database support with primitive types
-            // For now, skip when using subscriber database
+        // Get subscriber info from pre-loaded array
+        let mut sub = subs[uidx];
+
+        // Skip if subscriber has no data (msisdn == 0)
+        if sub.msisdn == 0 {
             continue;
-        } else {
-            let mut s = subs[uidx];
-            // Occasional IMEI change (new device) - only for non-DB mode
-            if rng.gen::<f64>() < cfg.imei_daily_change_prob {
-                s.imei = gen_imei(&mut rng);
-            }
-            s
-        };
+        }
+
+        // Occasional IMEI change (new device) - only for non-DB mode
+        if subscriber_db.is_none() && rng.gen::<f64>() < cfg.imei_daily_change_prob {
+            sub.imei = gen_imei(&mut rng);
+        }
 
         let c = &contacts[uidx % contacts.len()];
         let c_pool = &c.pool;

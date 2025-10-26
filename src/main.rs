@@ -250,32 +250,11 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Load subscriber database if provided
-    let subscriber_db = if let Some(ref db_path) = cfg.subscriber_db_path {
-        println!("Loading subscriber database from {:?}...", db_path);
-
-        // Auto-detect format
-        let mut db = if db_path.extension().and_then(|s| s.to_str()) == Some("arrow") {
-            SubscriberDatabase::load_from_arrow(db_path)?
-        } else {
-            SubscriberDatabase::load_from_csv(db_path)?
-        };
-
-        println!("Validating database...");
-        db.validate()?;
-
-        println!("Building snapshots for fast lookup...");
-        db.build_snapshots();
-
-        println!("✓ Subscriber database loaded:");
-        println!("  Events: {}", db.event_count());
-        println!("  Snapshots: {}", db.snapshot_count());
-        println!("  Unique IMSI: {}", db.unique_imsi_count());
-
-        Some(db)
-    } else {
-        None
-    };
+    // Subscriber database path (workers will load and filter their own range)
+    if let Some(ref db_path) = cfg.subscriber_db_path {
+        println!("Using subscriber database: {:?}", db_path);
+        println!("Note: Each worker will load and filter only its subscriber range");
+    }
 
     // Parse cell center from CLI or use config values
     let (center_lat, center_lon) = if let Some(ref cell_center_str) = args.cell_center {
@@ -377,7 +356,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         // Run workers in parallel with writer channels
-        let sub_db_ref = subscriber_db.as_ref();
+        let sub_db_path = cfg.subscriber_db_path.as_deref();
         ranges
             .par_iter()
             .enumerate()
@@ -386,7 +365,7 @@ fn main() -> anyhow::Result<()> {
                 let writer_idx = i % writer_tasks;
                 let writer_tx = writer_channels[writer_idx].clone();
 
-                worker_generate(day, i, (lo, hi), &cfg, &args.out, sub_db_ref, writer_tx)
+                worker_generate(day, i, (lo, hi), &cfg, &args.out, sub_db_path, writer_tx)
             })?;
 
         // Send Close messages to all writers

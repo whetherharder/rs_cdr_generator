@@ -158,6 +158,33 @@ pub fn read_events_from_arrow_range<P: AsRef<Path>>(
     Ok(events)
 }
 
+/// Read events from Arrow IPC file with timestamp range and MSISDN set filter
+/// This filters during reading to minimize memory usage
+pub fn read_events_from_arrow_filtered<P: AsRef<Path>>(
+    path: P,
+    start_ts: i64,
+    end_ts: i64,
+    msisdn_set: &std::collections::HashSet<String>,
+) -> Result<Vec<SubscriberEvent>> {
+    let file = File::open(&path)
+        .with_context(|| format!("Failed to open Arrow file: {:?}", path.as_ref()))?;
+
+    let reader = FileReader::try_new(file, None)
+        .context("Failed to create Arrow reader")?;
+
+    let mut events = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result.context("Failed to read batch")?;
+
+        // Filter by timestamp AND MSISDN
+        let filtered = filter_batch_by_timestamp_and_msisdn(&batch, start_ts, end_ts, msisdn_set)?;
+        events.extend(filtered);
+    }
+
+    Ok(events)
+}
+
 /// Convert Arrow RecordBatch to SubscriberEvent vector
 fn record_batch_to_events(batch: &RecordBatch) -> Result<Vec<SubscriberEvent>> {
     let timestamps = batch
@@ -257,6 +284,41 @@ fn filter_batch_by_timestamp(
     Ok(all_events
         .into_iter()
         .filter(|e| e.timestamp_ms >= start_ts && e.timestamp_ms <= end_ts)
+        .collect())
+}
+
+/// Filter RecordBatch by timestamp range AND MSISDN set
+fn filter_batch_by_timestamp_and_msisdn(
+    batch: &RecordBatch,
+    start_ts: i64,
+    end_ts: i64,
+    msisdn_set: &std::collections::HashSet<String>,
+) -> Result<Vec<SubscriberEvent>> {
+    let timestamps = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("Invalid timestamp column"))?;
+
+    // Quick check: if batch is entirely outside time range, skip
+    let min_ts = (0..timestamps.len()).map(|i| timestamps.value(i)).min();
+    let max_ts = (0..timestamps.len()).map(|i| timestamps.value(i)).max();
+
+    if let (Some(min), Some(max)) = (min_ts, max_ts) {
+        if max < start_ts || min > end_ts {
+            return Ok(Vec::new());
+        }
+    }
+
+    // Convert all events and filter by both timestamp and MSISDN
+    let all_events = record_batch_to_events(batch)?;
+    Ok(all_events
+        .into_iter()
+        .filter(|e| {
+            e.timestamp_ms >= start_ts
+                && e.timestamp_ms <= end_ts
+                && e.msisdn.as_ref().map_or(false, |m| msisdn_set.contains(m))
+        })
         .collect())
 }
 

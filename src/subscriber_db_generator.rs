@@ -1,7 +1,6 @@
 // Generator for synthetic subscriber database with realistic history
 use crate::identity::gen_imei;
 use crate::subscriber_db::{SubscriberEvent, SubscriberEventType};
-use crate::subscriber_db_arrow::write_events_to_arrow;
 use anyhow::Result;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;

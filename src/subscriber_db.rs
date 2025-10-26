@@ -513,6 +513,65 @@ impl SubscriberDatabase {
         db.build_indices();
         Ok(db)
     }
+
+    /// Load from Arrow with filtering during read (memory-efficient)
+    /// Reads batches and filters on-the-fly, avoiding loading entire file into memory
+    pub fn load_from_arrow_with_msisdn_filter<P: AsRef<Path>>(
+        path: P,
+        start_ts: i64,
+        end_ts: i64,
+        start_u: usize,
+        end_u: usize,
+        prefixes: &[String],
+    ) -> Result<Self> {
+        use crate::subscriber_db_arrow::read_events_from_arrow_filtered;
+        use std::collections::HashSet;
+
+        // Generate MSISDN set for this worker's range
+        let msisdn_set: HashSet<String> = (start_u..end_u)
+            .map(|idx| {
+                let prefix = &prefixes[idx % prefixes.len()];
+                let number = idx % 10_000_000;
+                format!("{}{:07}", prefix, number)
+            })
+            .collect();
+
+        // Read with filtering during read (batch-by-batch)
+        let events = read_events_from_arrow_filtered(path, start_ts, end_ts, &msisdn_set)?;
+
+        let mut db = SubscriberDatabase::new();
+        db.events = events;
+        db.build_indices();
+        Ok(db)
+    }
+
+    /// Filter database by MSISDN range (for worker partitioning)
+    /// Creates a new database containing only events for subscribers in [start_u..end_u) range
+    pub fn filter_by_msisdn_range(&self, start_u: usize, end_u: usize, prefixes: &[String]) -> Self {
+        use std::collections::HashSet;
+
+        // Generate expected MSISDNs for this worker's subscriber range
+        let msisdn_set: HashSet<String> = (start_u..end_u)
+            .map(|idx| {
+                let prefix = &prefixes[idx % prefixes.len()];
+                let number = idx % 10_000_000;
+                format!("{}{:07}", prefix, number)
+            })
+            .collect();
+
+        // Filter events to only include those for our MSISDNs
+        let filtered_events: Vec<SubscriberEvent> = self.events
+            .iter()
+            .filter(|e| e.msisdn.as_ref().map_or(false, |m| msisdn_set.contains(m)))
+            .cloned()
+            .collect();
+
+        // Create new database with filtered events
+        let mut db = SubscriberDatabase::new();
+        db.events = filtered_events;
+        db.build_indices();
+        db
+    }
 }
 
 /// Internal state tracker for building snapshots
