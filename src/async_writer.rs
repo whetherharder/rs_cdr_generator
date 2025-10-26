@@ -1,13 +1,13 @@
 // Async batched writer for CDR events using Tokio
 use crate::writer::EventRow;
 use anyhow::Result;
+use crossbeam_channel::Receiver;
 use csv::WriterBuilder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use tokio::sync::mpsc;
 
 /// Batch of EventRow objects ready to be written
 pub struct EventBatch {
@@ -54,7 +54,7 @@ pub enum WriterMessage {
 
 /// Async writer task that processes batches of events
 pub async fn writer_task(
-    mut rx: mpsc::Receiver<WriterMessage>,
+    rx: Receiver<WriterMessage>,
     out_dir: PathBuf,
     day_str: String,
     shard_id: usize,
@@ -66,7 +66,13 @@ pub async fn writer_task(
     let mut part_num = 1;
     let mut total_written = 0usize;
 
-    while let Some(msg) = rx.recv().await {
+    // Use crossbeam_channel recv() in async context
+    loop {
+        let msg = match rx.recv() {
+            Ok(msg) => msg,
+            Err(_) => break, // Channel closed
+        };
+
         match msg {
             WriterMessage::Batch(batch) => {
                 if batch.is_empty() {

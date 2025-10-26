@@ -13,7 +13,9 @@
 
 use chrono::{Datelike, Duration, TimeZone};
 use clap::Parser;
+use crossbeam_channel::unbounded;
 use rayon::prelude::*;
+use rs_cdr_generator::async_writer::{writer_task, WriterMessage};
 use rs_cdr_generator::cells::{ensure_cells_catalog, load_cells_catalog};
 use rs_cdr_generator::config::{load_config, parse_prefixes, Config};
 use rs_cdr_generator::generators::worker_generate;
@@ -328,14 +330,62 @@ fn main() -> anyhow::Result<()> {
             s = e;
         }
 
-        // Run workers in parallel
+        // Create Tokio runtime for async writers
+        let rt = tokio::runtime::Runtime::new()?;
+
+        // Determine number of writer tasks (default: workers / 2)
+        let writer_tasks = if cfg.writer_tasks > 0 {
+            cfg.writer_tasks
+        } else {
+            (w / 2).max(1)
+        };
+
+        // Create channels and spawn async writer tasks
+        let mut writer_channels = Vec::new();
+        let mut writer_handles = Vec::new();
+
+        for shard_id in 0..writer_tasks {
+            let (tx, rx) = unbounded();
+            writer_channels.push(tx);
+
+            let out_dir = args.out.clone();
+            let day_str_clone = day_str.clone();
+
+            let handle = rt.spawn(async move {
+                writer_task(
+                    rx,
+                    out_dir,
+                    day_str_clone,
+                    shard_id,
+                )
+                .await
+            });
+
+            writer_handles.push(handle);
+        }
+
+        // Run workers in parallel with writer channels
         let sub_db_ref = subscriber_db.as_ref();
         ranges
             .par_iter()
             .enumerate()
             .try_for_each(|(i, &(lo, hi))| {
-                worker_generate(day, i, (lo, hi), &cfg, &args.out, sub_db_ref)
+                // Map worker to writer shard (round-robin)
+                let writer_idx = i % writer_tasks;
+                let writer_tx = writer_channels[writer_idx].clone();
+
+                worker_generate(day, i, (lo, hi), &cfg, &args.out, sub_db_ref, writer_tx)
             })?;
+
+        // Send Close messages to all writers
+        for tx in writer_channels {
+            tx.send(WriterMessage::Close)?;
+        }
+
+        // Wait for all writer tasks to complete
+        for handle in writer_handles {
+            rt.block_on(handle)??;
+        }
 
         // Create summary and bundle
         create_daily_summary(&args.out, &day)?;

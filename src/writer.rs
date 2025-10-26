@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 // EventRow with primitive types for zero-copy performance
 // Serde will handle conversion to strings during serialization
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EventRow {
     #[serde(serialize_with = "serialize_str")]
     pub event_type: &'static str,

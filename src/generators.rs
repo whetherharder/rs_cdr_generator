@@ -1,10 +1,13 @@
 // Event generation logic for CALL, SMS, and DATA events
+use crate::async_writer::{EventBatch, WriterMessage};
 use crate::config::Config;
+use crate::event_pool::EventPool;
 use crate::identity::{build_contacts, build_subscribers, gen_imei, Subscriber};
 use crate::subscriber_db::SubscriberDatabase;
 use crate::timezone_utils::{to_epoch_ms, tz_from_name, tz_offset_minutes};
-use crate::writer::{EventRow, EventWriter};
+use crate::writer::EventRow;
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Weekday};
+use crossbeam_channel::Sender;
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use rand::rngs::StdRng;
@@ -100,13 +103,14 @@ impl CallGenerator {
 
     pub fn generate(
         &self,
+        event: &mut EventRow,
         sub: &Subscriber,
         start_local: DateTime<chrono_tz::Tz>,
         other_msisdn: u64,
         tz_name: &'static str,
         cell_id: u32,
         rng: &mut StdRng,
-    ) -> EventRow {
+    ) {
         let direction = if rng.gen::<f64>() < self.p_mo {
             "MO"
         } else {
@@ -144,30 +148,22 @@ impl CallGenerator {
 
         let end_local = start_local + Duration::seconds(dur_sec);
 
-        EventRow {
-            event_type: "CALL",
-            msisdn_src,
-            msisdn_dst,
-            direction,
-            start_ts_ms: to_epoch_ms(&start_local.with_timezone(&chrono::Utc)),
-            end_ts_ms: to_epoch_ms(&end_local.with_timezone(&chrono::Utc)),
-            tz_name,
-            tz_offset_min: tz_offset_minutes(&start_local),
-            duration_sec: dur_sec,
-            mccmnc: sub.mccmnc,
-            imsi: sub.imsi,
-            imei: sub.imei,
-            cell_id,
-            record_type: "mscVoiceRecord",
-            cause_for_record_closing: cause,
-            sms_segments: 0,
-            sms_status: "",
-            data_bytes_in: 0,
-            data_bytes_out: 0,
-            data_duration_sec: 0,
-            apn: "",
-            rat: "",
-        }
+        event.event_type = "CALL";
+        event.msisdn_src = msisdn_src;
+        event.msisdn_dst = msisdn_dst;
+        event.direction = direction;
+        event.start_ts_ms = to_epoch_ms(&start_local.with_timezone(&chrono::Utc));
+        event.end_ts_ms = to_epoch_ms(&end_local.with_timezone(&chrono::Utc));
+        event.tz_name = tz_name;
+        event.tz_offset_min = tz_offset_minutes(&start_local);
+        event.duration_sec = dur_sec;
+        event.mccmnc = sub.mccmnc;
+        event.imsi = sub.imsi;
+        event.imei = sub.imei;
+        event.cell_id = cell_id;
+        event.record_type = "mscVoiceRecord";
+        event.cause_for_record_closing = cause;
+        // Leave other fields at default (reset by pool)
     }
 }
 
@@ -195,13 +191,14 @@ impl SmsGenerator {
 
     pub fn generate(
         &self,
+        event: &mut EventRow,
         sub: &Subscriber,
         start_local: DateTime<chrono_tz::Tz>,
         other_msisdn: u64,
         tz_name: &'static str,
         cell_id: u32,
         rng: &mut StdRng,
-    ) -> EventRow {
+    ) {
         let direction = if rng.gen::<f64>() < self.p_mo {
             "MO"
         } else {
@@ -235,30 +232,24 @@ impl SmsGenerator {
             _ => 3,
         };
 
-        EventRow {
-            event_type: "SMS",
-            msisdn_src,
-            msisdn_dst,
-            direction,
-            start_ts_ms: to_epoch_ms(&start_local.with_timezone(&chrono::Utc)),
-            end_ts_ms: to_epoch_ms(&end_local.with_timezone(&chrono::Utc)),
-            tz_name,
-            tz_offset_min: tz_offset_minutes(&start_local),
-            duration_sec: dur,
-            mccmnc: sub.mccmnc,
-            imsi: sub.imsi,
-            imei: sub.imei,
-            cell_id,
-            record_type,
-            cause_for_record_closing: cause,
-            sms_segments,
-            sms_status,
-            data_bytes_in: 0,
-            data_bytes_out: 0,
-            data_duration_sec: 0,
-            apn: "",
-            rat: "",
-        }
+        event.event_type = "SMS";
+        event.msisdn_src = msisdn_src;
+        event.msisdn_dst = msisdn_dst;
+        event.direction = direction;
+        event.start_ts_ms = to_epoch_ms(&start_local.with_timezone(&chrono::Utc));
+        event.end_ts_ms = to_epoch_ms(&end_local.with_timezone(&chrono::Utc));
+        event.tz_name = tz_name;
+        event.tz_offset_min = tz_offset_minutes(&start_local);
+        event.duration_sec = dur;
+        event.mccmnc = sub.mccmnc;
+        event.imsi = sub.imsi;
+        event.imei = sub.imei;
+        event.cell_id = cell_id;
+        event.record_type = record_type;
+        event.cause_for_record_closing = cause;
+        event.sms_segments = sms_segments;
+        event.sms_status = sms_status;
+        // Leave data fields at default (reset by pool)
     }
 }
 
@@ -288,11 +279,12 @@ impl DataGenerator {
 
     pub fn generate(
         &self,
+        event: &mut EventRow,
         sub: &Subscriber,
         start_local: DateTime<chrono_tz::Tz>,
         tz_name: &'static str,
         rng: &mut StdRng,
-    ) -> EventRow {
+    ) {
         let rat = match self.rat_dist.sample(rng) {
             0 => "WCDMA",
             1 => "LTE",
@@ -330,30 +322,27 @@ impl DataGenerator {
         let record_types = ["sgsnPDPRecord", "pgwRecord"];
         let record_type = record_types[rng.gen_range(0..record_types.len())];
 
-        EventRow {
-            event_type: "DATA",
-            msisdn_src: sub.msisdn,
-            msisdn_dst: 0,
-            direction: "MO",
-            start_ts_ms: to_epoch_ms(&start_local.with_timezone(&chrono::Utc)),
-            end_ts_ms: to_epoch_ms(&end_local.with_timezone(&chrono::Utc)),
-            tz_name,
-            tz_offset_min: tz_offset_minutes(&start_local),
-            duration_sec: dur,
-            mccmnc: sub.mccmnc,
-            imsi: sub.imsi,
-            imei: sub.imei,
-            cell_id,
-            record_type,
-            cause_for_record_closing: "normalRelease",
-            sms_segments: 0,
-            sms_status: "",
-            data_bytes_in: up,
-            data_bytes_out: down,
-            data_duration_sec: dur,
-            apn,
-            rat,
-        }
+        event.event_type = "DATA";
+        event.msisdn_src = sub.msisdn;
+        event.msisdn_dst = 0;
+        event.direction = "MO";
+        event.start_ts_ms = to_epoch_ms(&start_local.with_timezone(&chrono::Utc));
+        event.end_ts_ms = to_epoch_ms(&end_local.with_timezone(&chrono::Utc));
+        event.tz_name = tz_name;
+        event.tz_offset_min = tz_offset_minutes(&start_local);
+        event.duration_sec = dur;
+        event.mccmnc = sub.mccmnc;
+        event.imsi = sub.imsi;
+        event.imei = sub.imei;
+        event.cell_id = cell_id;
+        event.record_type = record_type;
+        event.cause_for_record_closing = "normalRelease";
+        event.data_bytes_in = up;
+        event.data_bytes_out = down;
+        event.data_duration_sec = dur;
+        event.apn = apn;
+        event.rat = rat;
+        // Leave SMS fields at default (reset by pool)
     }
 }
 
@@ -373,6 +362,7 @@ pub fn worker_generate(
     cfg: &Config,
     out_dir: &Path,
     subscriber_db: Option<&SubscriberDatabase>,
+    writer_tx: Sender<WriterMessage>,
 ) -> anyhow::Result<()> {
     let seed = (cfg.workers as u64).wrapping_mul(1000) + shard_id as u64;
     let mut rng = StdRng::seed_from_u64(seed);
@@ -413,7 +403,13 @@ pub fn worker_generate(
     let data_gen = DataGenerator::new(HashMap::new(), vec![]);
 
     let day_str = day.format("%Y-%m-%d").to_string();
-    let mut writer = EventWriter::new(out_dir, &day_str, cfg.rotate_bytes, shard_id)?;
+
+    // Initialize event pool for zero-allocation event generation
+    let mut event_pool = EventPool::new(cfg.event_pool_size);
+
+    // Initialize batch for async writing
+    let batch_capacity = cfg.batch_size_bytes / 230; // ~230 bytes per event
+    let mut batch = EventBatch::new(batch_capacity);
 
     let day_start_local = tz
         .with_ymd_and_hms(day.year(), day.month(), day.day(), 0, 0, 0)
@@ -516,9 +512,20 @@ pub fn worker_generate(
             };
 
             let cell_id = rng.gen_range(10_000..100_000);
-            let row = call_gen.generate(&sub, start_local, other_msisdn, tz_name, cell_id, &mut rng);
-            writer.write_row(&row)?;
+
+            // Acquire event from pool and populate it
+            let event = event_pool.acquire();
+            call_gen.generate(event, &sub, start_local, other_msisdn, tz_name, cell_id, &mut rng);
+
+            // Add to batch (clone because batch needs ownership)
+            batch.push(event.clone());
             stats.calls += 1;
+
+            // Send batch if full
+            if batch.is_full(cfg.batch_size_bytes) {
+                writer_tx.send(WriterMessage::Batch(batch))?;
+                batch = EventBatch::new(batch_capacity);
+            }
         }
 
         // Generate SMS events
@@ -544,9 +551,20 @@ pub fn worker_generate(
             };
 
             let cell_id = rng.gen_range(10_000..100_000);
-            let row = sms_gen.generate(&sub, start_local, other_msisdn, tz_name, cell_id, &mut rng);
-            writer.write_row(&row)?;
+
+            // Acquire event from pool and populate it
+            let event = event_pool.acquire();
+            sms_gen.generate(event, &sub, start_local, other_msisdn, tz_name, cell_id, &mut rng);
+
+            // Add to batch (clone because batch needs ownership)
+            batch.push(event.clone());
             stats.sms += 1;
+
+            // Send batch if full
+            if batch.is_full(cfg.batch_size_bytes) {
+                writer_tx.send(WriterMessage::Batch(batch))?;
+                batch = EventBatch::new(batch_capacity);
+            }
         }
 
         // Generate DATA sessions
@@ -559,13 +577,28 @@ pub fn worker_generate(
                 continue;
             }
 
-            let row = data_gen.generate(&sub, start_local, tz_name, &mut rng);
-            writer.write_row(&row)?;
+            // Acquire event from pool and populate it
+            let event = event_pool.acquire();
+            data_gen.generate(event, &sub, start_local, tz_name, &mut rng);
+
+            // Add to batch (clone because batch needs ownership)
+            batch.push(event.clone());
             stats.data += 1;
+
+            // Send batch if full
+            if batch.is_full(cfg.batch_size_bytes) {
+                writer_tx.send(WriterMessage::Batch(batch))?;
+                batch = EventBatch::new(batch_capacity);
+            }
         }
     }
 
-    writer.close()?;
+    // Send remaining events in batch
+    if !batch.is_empty() {
+        writer_tx.send(WriterMessage::Batch(batch))?;
+    }
+
+    // No need to send Close here - main.rs will handle that after all workers complete
 
     // Write stats
     let stat_path = out_dir
