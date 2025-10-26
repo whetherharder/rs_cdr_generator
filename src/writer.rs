@@ -70,10 +70,11 @@ pub struct EventWriter {
     current_writer: Option<Writer<File>>,
     current_size: u64,
     day_dir: PathBuf,
+    shard_id: usize,
 }
 
 impl EventWriter {
-    pub fn new(out_dir: &Path, day_str: &str, rotate_bytes: u64) -> anyhow::Result<Self> {
+    pub fn new(out_dir: &Path, day_str: &str, rotate_bytes: u64, shard_id: usize) -> anyhow::Result<Self> {
         let day_dir = out_dir.join(day_str);
         std::fs::create_dir_all(&day_dir)?;
 
@@ -85,6 +86,7 @@ impl EventWriter {
             current_writer: None,
             current_size: 0,
             day_dir,
+            shard_id,
         };
 
         writer.open_new_file()?;
@@ -97,7 +99,7 @@ impl EventWriter {
             writer.flush()?;
         }
 
-        let filename = format!("cdr_{}_part{:03}.csv", self.day_str, self.part_num);
+        let filename = format!("cdr_{}_shard{:03}_part{:03}.csv", self.day_str, self.shard_id, self.part_num);
         let filepath = self.day_dir.join(&filename);
 
         let file = File::create(&filepath)?;
@@ -124,7 +126,7 @@ impl EventWriter {
                 writer.flush()?;
 
                 // Get actual file size for accuracy
-                let filename = format!("cdr_{}_part{:03}.csv", self.day_str, self.part_num);
+                let filename = format!("cdr_{}_shard{:03}_part{:03}.csv", self.day_str, self.shard_id, self.part_num);
                 let filepath = self.day_dir.join(&filename);
                 let actual_size = std::fs::metadata(&filepath)?.len();
 
