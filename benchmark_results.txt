@@ -2,26 +2,36 @@
 
 === Benchmark: 1K subscribers (redb) ===
 Benchmark 1: ./target/release/rs_cdr_generator --start 2024-01-03 --days 1 --out bench_test --config bench_config_1k.yaml --seed 42
-  Time (mean ± σ):     171.1 ms ±   9.8 ms    [User: 179.2 ms, System: 27.5 ms]
-  Range (min … max):   161.1 ms … 180.6 ms    3 runs
- 
+  Time (mean ± σ):     165.7 ms ±   3.9 ms    [User: 177.9 ms, System: 26.0 ms]
+  Range (min … max):   161.7 ms … 169.5 ms    3 runs
+
 
 === Benchmark: 10K subscribers (redb) ===
 Benchmark 1: ./target/release/rs_cdr_generator --start 2024-01-03 --days 1 --out bench_test --config bench_config_10k.yaml --seed 42
-  Time (mean ± σ):     774.0 ms ±  16.3 ms    [User: 1413.0 ms, System: 121.6 ms]
-  Range (min … max):   759.5 ms … 791.6 ms    3 runs
- 
+  Time (mean ± σ):     761.0 ms ±   7.3 ms    [User: 1419.6 ms, System: 107.2 ms]
+  Range (min … max):   755.1 ms … 769.1 ms    3 runs
+
 
 === Benchmark: 100K subscribers (redb) ===
 Benchmark 1: ./target/release/rs_cdr_generator --start 2024-01-03 --days 1 --out bench_test --config bench_config_100k.yaml --seed 42
-  Time (mean ± σ):      8.114 s ±  0.477 s    [User: 16.846 s, System: 1.721 s]
-  Range (min … max):    7.710 s …  8.640 s    3 runs
- 
+  Time (mean ± σ):      6.879 s ±  0.068 s    [User: 15.131 s, System: 1.361 s]
+  Range (min … max):    6.801 s …  6.931 s    3 runs
+
 
 === Benchmark: 1M subscribers (redb) ===
 Benchmark 1: ./target/release/rs_cdr_generator --start 2024-01-03 --days 1 --out bench_test --config bench_config_1m.yaml --seed 42
-  Time (mean ± σ):     99.002 s ±  8.244 s    [User: 224.012 s, System: 23.060 s]
-  Range (min … max):   93.743 s … 108.504 s    3 runs
- 
+  Time (mean ± σ):     93.278 s ±  3.446 s    [User: 212.801 s, System: 19.950 s]
+  Range (min … max):   89.582 s … 96.402 s    3 runs
+
 
 === All benchmarks complete ===
+
+=== Performance Improvement Summary ===
+
+Archiving optimization (Phase 1 + Phase 2):
+- Phase 1: Increased buffer size from 8KB to 2MB
+- Phase 2: Parallel file reading with Rayon + sequential write
+
+Results:
+- 100K subscribers: 8.114s → 6.879s (-15.2% / -1.235s)
+- 1M subscribers:  99.002s → 93.278s (-5.8% / -5.7s)

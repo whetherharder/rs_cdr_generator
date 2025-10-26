@@ -65,6 +65,8 @@ pub fn create_daily_summary(out_dir: &Path, day: &DateTime<Tz>) -> anyhow::Resul
 
 /// Combine all CDR shard files for a day and compress into a single .gz file
 pub fn bundle_day(out_dir: &Path, day: &DateTime<Tz>, cleanup: bool) -> anyhow::Result<PathBuf> {
+    use rayon::prelude::*;
+
     let day_str = day.format("%Y-%m-%d").to_string();
     let day_dir = out_dir.join(&day_str);
 
@@ -91,14 +93,19 @@ pub fn bundle_day(out_dir: &Path, day: &DateTime<Tz>, cleanup: bool) -> anyhow::
     // Create final combined gzip file path
     let gz_path = out_dir.join(format!("cdr_{}.csv.gz", day_str));
 
-    // Concatenate all compressed shard files
-    // This is valid for gzip format - multiple gzip streams can be concatenated
-    let mut output = File::create(&gz_path)?;
+    // Phase 1: Parallel read - read all files into memory in parallel
+    let file_contents: Vec<Vec<u8>> = cdr_files
+        .par_iter()
+        .map(|entry| {
+            std::fs::read(entry.path())
+                .map_err(|e| anyhow::anyhow!("Failed to read {:?}: {}", entry.path(), e))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
-    for entry in &cdr_files {
-        let file_path = entry.path();
-        let mut input = File::open(&file_path)?;
-        std::io::copy(&mut input, &mut output)?;
+    // Phase 2: Sequential write - write all chunks in order
+    let mut output = File::create(&gz_path)?;
+    for chunk in &file_contents {
+        std::io::Write::write_all(&mut output, chunk)?;
     }
 
     output.flush()?;
