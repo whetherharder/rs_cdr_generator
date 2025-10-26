@@ -1,0 +1,122 @@
+# Small Test Configuration
+# For quick testing and development (1,000 subscribers)
+
+# Population settings
+subscribers: 1000
+cells: 500
+prefixes:
+  - "31612"
+  - "31613"
+mccmnc_pool:
+  - "20408"  # KPN Netherlands
+  - "20416"  # T-Mobile Netherlands
+
+# Geographic settings (Amsterdam region)
+center_lat: 52.37
+center_lon: 4.895
+radius_km: 25.0
+
+# Event rates per user per day (moderate activity)
+avg_calls_per_user: 3.5
+avg_sms_per_user: 5.2
+avg_data_sessions_per_user: 12.0
+
+# MO/MT distribution
+mo_share_call: 0.5   # 50% mobile-originated calls
+mo_share_sms: 0.5    # 50% mobile-originated SMS
+
+# Device behavior
+imei_daily_change_prob: 0.02  # 2% chance of IMEI change per day
+
+# Call dispositions (weighted probabilities, must sum to 1.0)
+call_dispositions:
+  ANSWERED: 0.82
+  NO ANSWER: 0.12
+  BUSY: 0.04
+  FAILED: 0.015
+  CONGESTION: 0.005
+
+# Call duration quantiles (seconds)
+call_duration_quantiles:
+  p50: 75    # Median call duration: 75 seconds
+  p90: 240   # 90th percentile: 4 minutes
+
+# Temporal patterns - hourly multipliers (24 values)
+diurnal_weekday:
+  - 0.3   # 00:00
+  - 0.2   # 01:00
+  - 0.15  # 02:00
+  - 0.1   # 03:00
+  - 0.1   # 04:00
+  - 0.15  # 05:00
+  - 0.3   # 06:00
+  - 0.6   # 07:00
+  - 1.2   # 08:00
+  - 1.4   # 09:00
+  - 1.3   # 10:00
+  - 1.2   # 11:00
+  - 1.1   # 12:00
+  - 1.0   # 13:00
+  - 1.1   # 14:00
+  - 1.2   # 15:00
+  - 1.3   # 16:00
+  - 1.5   # 17:00
+  - 1.6   # 18:00
+  - 1.4   # 19:00
+  - 1.2   # 20:00
+  - 1.0   # 21:00
+  - 0.7   # 22:00
+  - 0.5   # 23:00
+
+diurnal_weekend:
+  - 0.2   # 00:00
+  - 0.15  # 01:00
+  - 0.1   # 02:00
+  - 0.1   # 03:00
+  - 0.1   # 04:00
+  - 0.1   # 05:00
+  - 0.2   # 06:00
+  - 0.3   # 07:00
+  - 0.5   # 08:00
+  - 0.8   # 09:00
+  - 1.0   # 10:00
+  - 1.2   # 11:00
+  - 1.3   # 12:00
+  - 1.2   # 13:00
+  - 1.1   # 14:00
+  - 1.0   # 15:00
+  - 1.1   # 16:00
+  - 1.3   # 17:00
+  - 1.4   # 18:00
+  - 1.3   # 19:00
+  - 1.2   # 20:00
+  - 1.0   # 21:00
+  - 0.6   # 22:00
+  - 0.4   # 23:00
+
+# Seasonal patterns - monthly multipliers
+seasonality:
+  1: 0.95   # January
+  2: 0.9    # February
+  3: 1.0    # March
+  4: 1.05   # April
+  5: 1.1    # May
+  6: 1.15   # June
+  7: 1.2    # July
+  8: 1.15   # August
+  9: 1.05   # September
+  10: 1.0   # October
+  11: 0.95  # November
+  12: 1.0   # December
+
+# Special days (optional)
+special_days: {}
+
+# File rotation threshold (bytes)
+rotate_bytes: 50000000  # ~50 MB for small tests
+
+# Timezone for local time generation
+tz_name: "Europe/Amsterdam"
+
+# Number of worker processes (0 = auto-detect CPU count)
+workers: 0

@@ -1,0 +1,131 @@
+# Large Scale Configuration
+# For large-scale production simulation (500,000 - 1,000,000 subscribers)
+
+# Population settings
+subscribers: 1000000
+cells: 5000
+prefixes:
+  - "31612"
+  - "31613"
+  - "31620"
+  - "31621"
+  - "31630"
+  - "31640"
+  - "31650"
+mccmnc_pool:
+  - "20408"  # KPN Netherlands
+  - "20416"  # T-Mobile Netherlands
+  - "20420"  # Vodafone Netherlands
+
+# Geographic settings (entire Netherlands coverage)
+center_lat: 52.37
+center_lon: 4.895
+radius_km: 100.0
+
+# Event rates per user per day (high activity)
+avg_calls_per_user: 5.0
+avg_sms_per_user: 8.0
+avg_data_sessions_per_user: 20.0
+
+# MO/MT distribution
+mo_share_call: 0.55
+mo_share_sms: 0.52
+
+# Device behavior
+imei_daily_change_prob: 0.01  # 1% chance per day
+
+# Call dispositions
+call_dispositions:
+  ANSWERED: 0.87
+  NO ANSWER: 0.09
+  BUSY: 0.025
+  FAILED: 0.01
+  CONGESTION: 0.005
+
+# Call duration quantiles
+call_duration_quantiles:
+  p50: 95
+  p90: 320
+
+# Temporal patterns
+diurnal_weekday:
+  - 0.3
+  - 0.2
+  - 0.15
+  - 0.1
+  - 0.1
+  - 0.15
+  - 0.3
+  - 0.6
+  - 1.2
+  - 1.4
+  - 1.3
+  - 1.2
+  - 1.1
+  - 1.0
+  - 1.1
+  - 1.2
+  - 1.3
+  - 1.5
+  - 1.6
+  - 1.4
+  - 1.2
+  - 1.0
+  - 0.7
+  - 0.5
+
+diurnal_weekend:
+  - 0.2
+  - 0.15
+  - 0.1
+  - 0.1
+  - 0.1
+  - 0.1
+  - 0.2
+  - 0.3
+  - 0.5
+  - 0.8
+  - 1.0
+  - 1.2
+  - 1.3
+  - 1.2
+  - 1.1
+  - 1.0
+  - 1.1
+  - 1.3
+  - 1.4
+  - 1.3
+  - 1.2
+  - 1.0
+  - 0.6
+  - 0.4
+
+seasonality:
+  1: 0.95
+  2: 0.9
+  3: 1.0
+  4: 1.05
+  5: 1.1
+  6: 1.15
+  7: 1.2
+  8: 1.15
+  9: 1.05
+  10: 1.0
+  11: 0.95
+  12: 1.0
+
+special_days:
+  "2025-01-01": 0.6
+  "2025-04-27": 1.4
+  "2025-12-25": 0.7
+  "2025-12-26": 0.7
+  "2025-12-31": 1.5
+
+# File rotation threshold (larger files for efficiency)
+rotate_bytes: 200000000  # ~200 MB
+
+# Timezone
+tz_name: "Europe/Amsterdam"
+
+# Workers (optimize for large scale)
+workers: 0  # Will auto-detect, recommend 16-32 for large datasets
