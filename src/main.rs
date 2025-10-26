@@ -20,7 +20,7 @@ use rs_cdr_generator::cells::{ensure_cells_catalog, load_cells_catalog};
 use rs_cdr_generator::config::{load_config, parse_prefixes, Config};
 use rs_cdr_generator::generators::worker_generate;
 use rs_cdr_generator::subscriber_db::SubscriberDatabase;
-use rs_cdr_generator::subscriber_db_generator::{export_to_csv, generate_database, GeneratorConfig};
+use rs_cdr_generator::subscriber_db_generator::{generate_database_parallel_arrow, GeneratorConfig};
 use rs_cdr_generator::timezone_utils::tz_from_name;
 use rs_cdr_generator::utils::{bundle_day, create_daily_summary};
 use std::path::PathBuf;
@@ -213,8 +213,8 @@ fn main() -> anyhow::Result<()> {
             start_timestamp_ms: 1704067200000, // 2024-01-01
         };
 
-        let events = generate_database(&gen_config)?;
-        export_to_csv(&events, gen_path)?;
+        // Generate in Arrow format (auto-detect by extension)
+        generate_database_parallel_arrow(&gen_config, gen_path)?;
 
         println!("Subscriber database generated successfully!");
 
@@ -228,7 +228,13 @@ fn main() -> anyhow::Result<()> {
     if cfg.validate_db_only {
         if let Some(ref db_path) = cfg.subscriber_db_path {
             println!("Loading subscriber database from {:?}...", db_path);
-            let db = SubscriberDatabase::load_from_csv(db_path)?;
+
+            // Auto-detect format
+            let db = if db_path.extension().and_then(|s| s.to_str()) == Some("arrow") {
+                SubscriberDatabase::load_from_arrow(db_path)?
+            } else {
+                SubscriberDatabase::load_from_csv(db_path)?
+            };
 
             println!("Validating database...");
             db.validate()?;
@@ -247,7 +253,13 @@ fn main() -> anyhow::Result<()> {
     // Load subscriber database if provided
     let subscriber_db = if let Some(ref db_path) = cfg.subscriber_db_path {
         println!("Loading subscriber database from {:?}...", db_path);
-        let mut db = SubscriberDatabase::load_from_csv(db_path)?;
+
+        // Auto-detect format
+        let mut db = if db_path.extension().and_then(|s| s.to_str()) == Some("arrow") {
+            SubscriberDatabase::load_from_arrow(db_path)?
+        } else {
+            SubscriberDatabase::load_from_csv(db_path)?
+        };
 
         println!("Validating database...");
         db.validate()?;

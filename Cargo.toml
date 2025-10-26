@@ -25,6 +25,10 @@ serde_yaml = "0.9"
 # CSV handling
 csv = "1.3"
 
+# Arrow for binary columnar format
+arrow = "53"
+arrow-ipc = "53"
+
 # Compression/archiving
 flate2 = "1.0"
 

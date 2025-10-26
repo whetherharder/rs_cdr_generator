@@ -487,6 +487,32 @@ impl SubscriberDatabase {
     pub fn get_all_unique_imsi(&self) -> Vec<String> {
         self.by_imsi.keys().cloned().collect()
     }
+
+    /// Load subscriber database from Arrow IPC file
+    pub fn load_from_arrow<P: AsRef<Path>>(path: P) -> Result<Self> {
+        use crate::subscriber_db_arrow::read_events_from_arrow;
+
+        let events = read_events_from_arrow(path)?;
+        let mut db = SubscriberDatabase::new();
+        db.events = events;
+        db.build_indices();
+        Ok(db)
+    }
+
+    /// Load subscriber database from Arrow IPC file with timestamp range filter
+    pub fn load_from_arrow_range<P: AsRef<Path>>(
+        path: P,
+        start_ts: i64,
+        end_ts: i64,
+    ) -> Result<Self> {
+        use crate::subscriber_db_arrow::read_events_from_arrow_range;
+
+        let events = read_events_from_arrow_range(path, start_ts, end_ts)?;
+        let mut db = SubscriberDatabase::new();
+        db.events = events;
+        db.build_indices();
+        Ok(db)
+    }
 }
 
 /// Internal state tracker for building snapshots
