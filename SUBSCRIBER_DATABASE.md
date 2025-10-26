@@ -55,7 +55,7 @@ This will:
   --out ./output
 ```
 
-**Note:** Currently, the subscriber database is loaded and validated, but CDR generation integration with historical snapshots is pending implementation.
+**Note:** When using a subscriber database, CDR generation uses historical snapshots to ensure that each event uses the correct IMSI/MSISDN/IMEI combination that was valid at the event's timestamp. This creates highly realistic telecom datasets with proper identity evolution over time.
 
 ## CSV Format
 
@@ -202,15 +202,40 @@ The validator checks:
 - MSISDN format: 8-15 digits
 - IMEI format: 15 digits with valid Luhn checksum
 
+## How It Works
+
+When you generate CDR with a subscriber database:
+
+1. **Database Loading**: The subscriber database is loaded and validated
+2. **Snapshot Building**: Pre-computed snapshots are created for efficient lookup
+3. **Event Generation**: For each CDR event:
+   - The generator looks up the subscriber's state at the event timestamp
+   - Uses the IMSI/MSISDN/IMEI that were valid at that moment
+   - Handles identity changes (device upgrades, SIM swaps, number reassignments)
+4. **Realistic Evolution**: CDR accurately reflects subscriber identity changes over time
+
+### Example Timeline
+
+```
+2024-01-01: NEW_SUBSCRIBER - IMSI: 20408123, MSISDN: 31612345, IMEI: 111222
+2024-01-15: CHANGE_DEVICE  - IMSI: 20408123, MSISDN: 31612345, IMEI: 333444
+2024-02-01: RELEASE_NUMBER - Number released
+2024-05-01: ASSIGN_NUMBER  - IMSI: 20408456, MSISDN: 31612345, IMEI: 555666 (new subscriber gets old number)
+```
+
+CDR generated for 2024-01-10 will use IMEI: 111222
+CDR generated for 2024-01-20 will use IMEI: 333444
+CDR generated for 2024-06-01 will use IMSI: 20408456, IMEI: 555666 (different subscriber!)
+
 ## Future Enhancements
 
 The following features are planned:
 
-1. **Integration with CDR Generation**: Use subscriber snapshots to generate CDR with historically accurate IMSI/MSISDN/IMEI mappings
-2. **Query Interface**: Query subscriber state at any point in time
-3. **Export to SQLite**: For more complex queries and analysis
-4. **Roaming Scenarios**: Support for subscribers changing networks (MCCMNC changes)
-5. **Churn Modeling**: More sophisticated subscriber lifecycle modeling
+1. **Query Interface**: Interactive CLI for querying subscriber state at any point in time
+2. **Export to SQLite**: For more complex queries and analysis
+3. **Roaming Scenarios**: Support for subscribers changing networks (MCCMNC changes)
+4. **Churn Modeling**: More sophisticated subscriber lifecycle modeling
+5. **Batch Import**: Import subscriber data from real network systems
 
 ## Troubleshooting
 

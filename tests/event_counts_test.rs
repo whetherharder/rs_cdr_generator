@@ -76,7 +76,7 @@ fn test_event_generation_counts() -> anyhow::Result<()> {
 
     // Generate events for each shard
     for (shard_id, &(lo, hi)) in ranges.iter().enumerate() {
-        worker_generate(day, shard_id, (lo, hi), &cfg, &out_dir)?;
+        worker_generate(day, shard_id, (lo, hi), &cfg, &out_dir, None)?;
     }
 
     // Read and aggregate all CSV files
@@ -275,7 +275,7 @@ fn test_no_duplicate_subscribers_across_shards() -> anyhow::Result<()> {
     }
 
     for (shard_id, &(lo, hi)) in ranges.iter().enumerate() {
-        worker_generate(day, shard_id, (lo, hi), &cfg, &out_dir)?;
+        worker_generate(day, shard_id, (lo, hi), &cfg, &out_dir, None)?;
     }
 
     // Collect DATA event subscribers per shard

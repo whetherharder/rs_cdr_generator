@@ -243,7 +243,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Load subscriber database if provided
-    let _subscriber_db = if let Some(ref db_path) = cfg.subscriber_db_path {
+    let subscriber_db = if let Some(ref db_path) = cfg.subscriber_db_path {
         println!("Loading subscriber database from {:?}...", db_path);
         let mut db = SubscriberDatabase::load_from_csv(db_path)?;
 
@@ -329,11 +329,12 @@ fn main() -> anyhow::Result<()> {
         }
 
         // Run workers in parallel
+        let sub_db_ref = subscriber_db.as_ref();
         ranges
             .par_iter()
             .enumerate()
             .try_for_each(|(i, &(lo, hi))| {
-                worker_generate(day, i, (lo, hi), &cfg, &args.out)
+                worker_generate(day, i, (lo, hi), &cfg, &args.out, sub_db_ref)
             })?;
 
         // Create summary and bundle

@@ -482,6 +482,11 @@ impl SubscriberDatabase {
     pub fn unique_imsi_count(&self) -> usize {
         self.by_imsi.len()
     }
+
+    /// Get all unique IMSIs in the database
+    pub fn get_all_unique_imsi(&self) -> Vec<String> {
+        self.by_imsi.keys().cloned().collect()
+    }
 }
 
 /// Internal state tracker for building snapshots
