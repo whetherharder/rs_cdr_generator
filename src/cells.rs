@@ -144,7 +144,6 @@ mod tests {
 
     #[test]
     fn test_ensure_and_load_cells() {
-        use std::fs;
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();

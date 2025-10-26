@@ -404,7 +404,7 @@ pub fn worker_generate(
     let data_gen = DataGenerator::new(HashMap::new(), vec![]);
 
     let day_str = day.format("%Y-%m-%d").to_string();
-    let mut writer = EventWriter::new(out_dir, &day_str, cfg.rotate_bytes)?;
+    let mut writer = EventWriter::new(out_dir, &day_str, cfg.rotate_bytes, shard_id)?;
 
     let day_start_local = tz
         .with_ymd_and_hms(day.year(), day.month(), day.day(), 0, 0, 0)

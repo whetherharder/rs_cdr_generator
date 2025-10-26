@@ -21,7 +21,7 @@ pub fn tz_offset_minutes<T: TimeZone>(dt: &DateTime<T>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
+    use chrono::Utc;
 
     #[test]
     fn test_tz_from_name() {
