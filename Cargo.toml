@@ -52,6 +52,12 @@ pathdiff = "0.2"
 # CPU count detection
 num_cpus = "1.16"
 
+# Memory profiling (optional)
+dhat = { version = "0.3", optional = true }
+
+[features]
+dhat-heap = ["dhat"]
+
 # Testing
 [dev-dependencies]
 tempfile = "3.8"

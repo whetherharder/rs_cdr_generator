@@ -11,6 +11,11 @@
 // - Persistent cells catalog reused across runs
 // - Stable subscriber identity: MSISDN ↔ IMSI ↔ MCCMNC
 
+// Memory profiling with dhat (enabled with --features dhat-heap)
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 use chrono::{Datelike, Duration, TimeZone};
 use clap::Parser;
 use crossbeam_channel::unbounded;
@@ -132,6 +137,9 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     let args = Args::parse();
 
     // Load and merge configuration with CLI priority

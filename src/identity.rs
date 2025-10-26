@@ -89,6 +89,7 @@ pub fn build_contacts(
     rng: &mut StdRng,
 ) -> Vec<Contacts> {
     use rand_distr::{Normal, Distribution};
+    use rand::seq::index::sample;
 
     let mut contacts_list = Vec::with_capacity(n_users);
     let normal = Normal::new(avg_contacts as f64, avg_contacts as f64 * 0.3).unwrap();
@@ -107,14 +108,9 @@ pub fn build_contacts(
             continue;
         }
 
-        // Random sample of contact indices
-        let mut pool: Vec<usize> = (0..n_users).collect();
-        // Fisher-Yates shuffle for random sampling
-        for i in (n_contacts..pool.len()).rev() {
-            let j = rng.gen_range(0..=i);
-            pool.swap(i, j);
-        }
-        pool.truncate(n_contacts);
+        // Efficient random sampling using reservoir sampling algorithm
+        // Memory: O(n_contacts) instead of O(n_users)
+        let pool: Vec<usize> = sample(rng, n_users, n_contacts).into_vec();
 
         // Zipf-like distribution for contact frequencies
         // More frequently contacted people have higher weights
