@@ -1,0 +1,8 @@
+# Конфиг для тестирования chunked processing с redb
+mo_share_call: 0.7
+mo_share_sms: 0.3
+workers: 4
+rotate_bytes: 100000000
+tz_name: "Europe/Moscow"
+chunk_size: 25000
+subscriber_db_redb_path: "test_db_1m.redb"

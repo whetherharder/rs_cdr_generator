@@ -62,9 +62,11 @@ pub struct Config {
     pub event_pool_size: usize,      // EventRow object pool size per worker
     pub batch_size_bytes: usize,     // Batch size for async writing (bytes)
     pub writer_tasks: usize,         // Number of async writer tasks (0 = auto)
+    pub chunk_size: usize,           // Number of subscribers to process per chunk (for memory efficiency)
 
     // Subscriber database
     pub subscriber_db_path: Option<PathBuf>,
+    pub subscriber_db_redb_path: Option<PathBuf>,  // Path to redb database (for chunked processing)
     pub generate_subscriber_db: Option<PathBuf>,
     pub db_size: usize,
     pub db_history_days: usize,
@@ -154,7 +156,9 @@ impl Default for Config {
             event_pool_size: 10_000,           // 10K EventRow objects per worker
             batch_size_bytes: 10_485_760,      // 10MB batch size
             writer_tasks: 0,                   // Auto-detect (workers / 2)
+            chunk_size: 25_000,                // Process 25K subscribers per chunk (for memory efficiency)
             subscriber_db_path: None,
+            subscriber_db_redb_path: None,
             generate_subscriber_db: None,
             db_size: 10_000,
             db_history_days: 365,

@@ -11,11 +11,6 @@
 // - Persistent cells catalog reused across runs
 // - Stable subscriber identity: MSISDN ↔ IMSI ↔ MCCMNC
 
-// Memory profiling with dhat (enabled with --features dhat-heap)
-#[cfg(feature = "dhat-heap")]
-#[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
-
 use chrono::{Datelike, Duration, TimeZone};
 use clap::Parser;
 use crossbeam_channel::unbounded;
@@ -26,6 +21,7 @@ use rs_cdr_generator::config::{load_config, parse_prefixes, Config};
 use rs_cdr_generator::generators::worker_generate;
 use rs_cdr_generator::subscriber_db::SubscriberDatabase;
 use rs_cdr_generator::subscriber_db_generator::{generate_database_parallel_arrow, GeneratorConfig};
+use rs_cdr_generator::subscriber_db_redb::convert_arrow_to_redb;
 use rs_cdr_generator::timezone_utils::tz_from_name;
 use rs_cdr_generator::utils::{bundle_day, create_daily_summary};
 use std::path::PathBuf;
@@ -134,12 +130,13 @@ struct Args {
     /// Только валидировать базу абонентов (не генерировать CDR)
     #[arg(long, default_value = "false")]
     validate_db: bool,
+
+    /// Конвертировать Arrow базу абонентов в redb формат (формат: arrow_path:redb_path)
+    #[arg(long)]
+    convert_to_redb: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
-    #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap();
-
     let args = Args::parse();
 
     // Load and merge configuration with CLI priority
@@ -188,6 +185,33 @@ fn main() -> anyhow::Result<()> {
     cfg.subscriber_db_path = args.subscriber_db.clone();
     cfg.generate_subscriber_db = args.generate_db.clone();
     cfg.validate_db_only = args.validate_db;
+
+    // Handle Arrow to redb conversion if requested
+    if let Some(ref convert_spec) = args.convert_to_redb {
+        let parts: Vec<&str> = convert_spec.split(':').collect();
+        if parts.len() != 2 {
+            eprintln!("Error: --convert-to-redb format must be: arrow_path:redb_path");
+            eprintln!("Example: --convert-to-redb test_db_1m.arrow:test_db_1m.redb");
+            std::process::exit(1);
+        }
+
+        let arrow_path = PathBuf::from(parts[0]);
+        let redb_path = PathBuf::from(parts[1]);
+
+        println!("Converting Arrow database to redb...");
+        println!("  Source: {:?}", arrow_path);
+        println!("  Target: {:?}", redb_path);
+
+        // Use start and end timestamps from config or defaults
+        let start_ts = 0i64;  // Start from beginning
+        let end_ts = 1735689600000i64;  // 2025-01-01 (far future to include all data)
+
+        convert_arrow_to_redb(&arrow_path, &redb_path, start_ts, end_ts)?;
+
+        println!("\nConversion complete!");
+        println!("You can now use --subscriber-db-redb-path {:?} in your config", redb_path);
+        return Ok(());
+    }
 
     if let Some(size) = args.db_size {
         cfg.db_size = size;

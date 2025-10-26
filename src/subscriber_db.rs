@@ -488,6 +488,11 @@ impl SubscriberDatabase {
         self.by_imsi.keys().cloned().collect()
     }
 
+    /// Get all snapshots (requires build_snapshots() to be called first)
+    pub fn get_snapshots(&self) -> &[SubscriberSnapshot] {
+        &self.snapshots
+    }
+
     /// Load subscriber database from Arrow IPC file
     pub fn load_from_arrow<P: AsRef<Path>>(path: P) -> Result<Self> {
         use crate::subscriber_db_arrow::read_events_from_arrow;
