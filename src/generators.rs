@@ -427,17 +427,18 @@ pub fn worker_generate(
     cfg: &Config,
     out_dir: &Path,
     subscriber_db_path: Option<&Path>,
+    redb: Option<&std::sync::Arc<SubscriberDbRedb>>,
     writer_tx: Sender<WriterMessage>,
 ) -> anyhow::Result<()> {
-    // If redb path is configured, use chunked processing for memory efficiency
-    if let Some(ref redb_path) = cfg.subscriber_db_redb_path {
+    // If redb database is provided, use chunked processing for memory efficiency
+    if let Some(redb_arc) = redb {
         return worker_generate_redb_chunked(
             day,
             shard_id,
             users_range,
             cfg,
             out_dir,
-            redb_path,
+            redb_arc.clone(),
             writer_tx,
         );
     }
@@ -774,16 +775,13 @@ fn worker_generate_redb_chunked(
     users_range: (usize, usize),
     cfg: &Config,
     out_dir: &Path,
-    redb_path: &Path,
+    redb: std::sync::Arc<SubscriberDbRedb>,
     writer_tx: Sender<WriterMessage>,
 ) -> anyhow::Result<()> {
     use chrono::Duration;
 
     let seed = (cfg.workers as u64).wrapping_mul(1000) + shard_id as u64;
     let mut rng = StdRng::seed_from_u64(seed);
-
-    // Open redb database
-    let redb = SubscriberDbRedb::open(redb_path)?;
 
     let tz = tz_from_name(&cfg.tz_name);
     let tz_name: &'static str = Box::leak(cfg.tz_name.clone().into_boxed_str());

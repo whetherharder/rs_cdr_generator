@@ -343,6 +343,11 @@ fn merge_config_value(config: &mut Config, key: &str, value: serde_yaml::Value) 
                 config.db_cooldown_days = v as usize;
             }
         }
+        "subscriber_db_redb_path" => {
+            if let Some(v) = value.as_str() {
+                config.subscriber_db_redb_path = Some(PathBuf::from(v));
+            }
+        }
         _ => {}
     }
 }

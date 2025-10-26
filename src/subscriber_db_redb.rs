@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use bincode::{deserialize, serialize};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -151,6 +151,15 @@ impl SubscriberDbRedb {
         }
 
         Ok(result)
+    }
+
+    /// Get the total number of MSISDNs (subscribers) in the database
+    /// This is faster than stats() as it doesn't deserialize snapshots
+    pub fn count_msisdns(&self) -> Result<usize> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SNAPSHOTS)?;
+
+        Ok(table.len()? as usize)
     }
 
     /// Get statistics about the database

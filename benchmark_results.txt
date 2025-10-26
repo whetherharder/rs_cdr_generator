@@ -1,29 +1,27 @@
-CDR Generator Benchmark Results
-Generated: Sat Oct 25 23:13:53 MSK 2025
-Host: Darwin uzum-vfomintsev-msk.local 24.6.0 Darwin Kernel Version 24.6.0: Mon Jul 14 11:28:17 PDT 2025; root:xnu-11417.140.69~1/RELEASE_X86_64 x86_64
-CPUs: 12
+=== CDR Generator Benchmark with redb ===
 
-[Small dataset]
-  Subscribers: 1000
-  Days: 1
-  Elapsed time: .051276000s
-  Throughput: 19502 subs/sec
+=== Benchmark: 1K subscribers (redb) ===
+Benchmark 1: ./target/release/rs_cdr_generator --start 2024-01-03 --days 1 --out bench_test --config bench_config_1k.yaml --seed 42
+  Time (mean ± σ):     171.1 ms ±   9.8 ms    [User: 179.2 ms, System: 27.5 ms]
+  Range (min … max):   161.1 ms … 180.6 ms    3 runs
+ 
 
-[Medium dataset]
-  Subscribers: 10000
-  Days: 1
-  Elapsed time: .228807000s
-  Throughput: 43704 subs/sec
+=== Benchmark: 10K subscribers (redb) ===
+Benchmark 1: ./target/release/rs_cdr_generator --start 2024-01-03 --days 1 --out bench_test --config bench_config_10k.yaml --seed 42
+  Time (mean ± σ):     774.0 ms ±  16.3 ms    [User: 1413.0 ms, System: 121.6 ms]
+  Range (min … max):   759.5 ms … 791.6 ms    3 runs
+ 
 
-[Large dataset]
-  Subscribers: 50000
-  Days: 1
-  Elapsed time: 1.733800000s
-  Throughput: 28838 subs/sec
+=== Benchmark: 100K subscribers (redb) ===
+Benchmark 1: ./target/release/rs_cdr_generator --start 2024-01-03 --days 1 --out bench_test --config bench_config_100k.yaml --seed 42
+  Time (mean ± σ):      8.114 s ±  0.477 s    [User: 16.846 s, System: 1.721 s]
+  Range (min … max):    7.710 s …  8.640 s    3 runs
+ 
 
-[Very large dataset]
-  Subscribers: 100000
-  Days: 1
-  Elapsed time: 8.423752000s
-  Throughput: 11871 subs/sec
+=== Benchmark: 1M subscribers (redb) ===
+Benchmark 1: ./target/release/rs_cdr_generator --start 2024-01-03 --days 1 --out bench_test --config bench_config_1m.yaml --seed 42
+  Time (mean ± σ):     99.002 s ±  8.244 s    [User: 224.012 s, System: 23.060 s]
+  Range (min … max):   93.743 s … 108.504 s    3 runs
+ 
 
+=== All benchmarks complete ===

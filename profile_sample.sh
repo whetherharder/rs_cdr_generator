@@ -43,6 +43,10 @@ while [[ $# -gt 0 ]]; do
             OUTPUT_DIR="$2"
             shift 2
             ;;
+        --config)
+            CONFIG="$2"
+            shift 2
+            ;;
         -h|--help)
             echo "Usage: $0 [options]"
             echo ""
@@ -72,22 +76,31 @@ echo "  Sampling duration: ${DURATION}s"
 echo "  Output directory: ${OUTPUT_DIR}"
 echo ""
 
-# Build with profiling profile
-echo "Building with profiling symbols..."
-cargo build --profile=profiling --quiet
+# Build with debug symbols
+echo "Building with debug symbols..."
+cargo build --release --quiet
 echo -e "${GREEN}✓ Build complete${NC}"
 echo ""
 
-BINARY="./target/profiling/rs_cdr_generator"
+BINARY="./target/release/rs_cdr_generator"
 TEST_OUTPUT="${OUTPUT_DIR}/test_output"
 SAMPLE_OUTPUT="${OUTPUT_DIR}/sample_output.txt"
 
 echo "Starting CDR generator in background..."
-"${BINARY}" \
-    --subs "${SUBS}" \
-    --start "${START_DATE}" \
-    --days "${DAYS}" \
-    --out "${TEST_OUTPUT}" &
+if [ -n "${CONFIG}" ]; then
+    "${BINARY}" \
+        --start "${START_DATE}" \
+        --days "${DAYS}" \
+        --out "${TEST_OUTPUT}" \
+        --config "${CONFIG}" \
+        --seed 42 &
+else
+    "${BINARY}" \
+        --subs "${SUBS}" \
+        --start "${START_DATE}" \
+        --days "${DAYS}" \
+        --out "${TEST_OUTPUT}" &
+fi
 
 PID=$!
 echo "Process started with PID: ${PID}"

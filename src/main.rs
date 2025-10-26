@@ -342,7 +342,27 @@ fn main() -> anyhow::Result<()> {
 
         // Split users uniformly across workers
         let w = cfg.workers;
-        let subs = args.subs;
+
+        // Open redb database if configured (will be shared across all workers)
+        let redb_arc = if let Some(ref redb_path) = cfg.subscriber_db_redb_path {
+            use rs_cdr_generator::subscriber_db_redb::SubscriberDbRedb;
+            use std::sync::Arc;
+            let redb = SubscriberDbRedb::open(redb_path)?;
+            Some(Arc::new(redb))
+        } else {
+            None
+        };
+
+        // Determine number of subscribers
+        let subs = if let Some(ref redb) = redb_arc {
+            let count = redb.count_msisdns()?;
+            println!("Auto-detected {} subscribers from redb database", count);
+            count
+        } else {
+            // Use command-line argument
+            args.subs
+        };
+
         let shard_size = subs / w;
 
         let mut ranges = Vec::new();
@@ -397,7 +417,7 @@ fn main() -> anyhow::Result<()> {
                 let writer_idx = i % writer_tasks;
                 let writer_tx = writer_channels[writer_idx].clone();
 
-                worker_generate(day, i, (lo, hi), &cfg, &args.out, sub_db_path, writer_tx)
+                worker_generate(day, i, (lo, hi), &cfg, &args.out, sub_db_path, redb_arc.as_ref(), writer_tx)
             })?;
 
         // Send Close messages to all writers
