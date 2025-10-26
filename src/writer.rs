@@ -1,7 +1,10 @@
 // CSV event writer with file rotation
 use csv::{Writer, WriterBuilder};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use serde::Serialize;
 use std::fs::File;
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize)]
@@ -61,13 +64,14 @@ impl Default for EventRow {
 
 /// Manages rotating CSV files for CDR events
 /// Auto-rotates when file size exceeds threshold
+/// Each file is compressed on-the-fly with gzip
 pub struct EventWriter {
     #[allow(dead_code)]
     out_dir: PathBuf,
     day_str: String,
     rotate_bytes: u64,
     part_num: u32,
-    current_writer: Option<Writer<File>>,
+    current_writer: Option<Writer<GzEncoder<BufWriter<File>>>>,
     current_size: u64,
     day_dir: PathBuf,
     shard_id: usize,
@@ -97,16 +101,23 @@ impl EventWriter {
         // Close current file if any
         if let Some(mut writer) = self.current_writer.take() {
             writer.flush()?;
+            // Finish compression
+            writer.into_inner()?.finish()?;
         }
 
-        let filename = format!("cdr_{}_shard{:03}_part{:03}.csv", self.day_str, self.shard_id, self.part_num);
+        let filename = format!("cdr_{}_shard{:03}_part{:03}.csv.gz", self.day_str, self.shard_id, self.part_num);
         let filepath = self.day_dir.join(&filename);
 
         let file = File::create(&filepath)?;
+        // Use 256KB buffer for better I/O performance
+        let buffered = BufWriter::with_capacity(256 * 1024, file);
+        // Compress on-the-fly in worker thread
+        let compressed = GzEncoder::new(buffered, Compression::default());
+
         let wtr = WriterBuilder::new()
             .delimiter(b';')
             .has_headers(true)
-            .from_writer(file);
+            .from_writer(compressed);
         self.current_size = std::fs::metadata(&filepath)?.len();
         self.current_writer = Some(wtr);
 
@@ -126,7 +137,7 @@ impl EventWriter {
                 writer.flush()?;
 
                 // Get actual file size for accuracy
-                let filename = format!("cdr_{}_shard{:03}_part{:03}.csv", self.day_str, self.shard_id, self.part_num);
+                let filename = format!("cdr_{}_shard{:03}_part{:03}.csv.gz", self.day_str, self.shard_id, self.part_num);
                 let filepath = self.day_dir.join(&filename);
                 let actual_size = std::fs::metadata(&filepath)?.len();
 
@@ -146,6 +157,8 @@ impl EventWriter {
     pub fn close(&mut self) -> anyhow::Result<()> {
         if let Some(mut writer) = self.current_writer.take() {
             writer.flush()?;
+            // Finish compression and flush all buffers
+            writer.into_inner()?.finish()?;
         }
         Ok(())
     }

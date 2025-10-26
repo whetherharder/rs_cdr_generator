@@ -1,11 +1,9 @@
 // Utility functions for bundling and aggregation
 use chrono::DateTime;
 use chrono_tz::Tz;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,13 +72,13 @@ pub fn bundle_day(out_dir: &Path, day: &DateTime<Tz>, cleanup: bool) -> anyhow::
         anyhow::bail!("Day directory not found: {:?}", day_dir);
     }
 
-    // Collect all CDR shard files (sorted by name for consistent ordering)
+    // Collect all compressed CDR shard files (sorted by name for consistent ordering)
     let mut cdr_files: Vec<_> = std::fs::read_dir(&day_dir)?
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            name_str.starts_with("cdr_") && name_str.ends_with(".csv")
+            name_str.starts_with("cdr_") && name_str.ends_with(".csv.gz")
         })
         .collect();
 
@@ -90,52 +88,22 @@ pub fn bundle_day(out_dir: &Path, day: &DateTime<Tz>, cleanup: bool) -> anyhow::
         anyhow::bail!("No CDR files found in directory: {:?}", day_dir);
     }
 
-    // Create combined CDR file path
-    let combined_path = out_dir.join(format!("cdr_{}.csv", day_str));
+    // Create final combined gzip file path
     let gz_path = out_dir.join(format!("cdr_{}.csv.gz", day_str));
 
-    // Combine all CDR files into one
-    let mut combined_file = File::create(&combined_path)?;
-    let mut first_file = true;
+    // Concatenate all compressed shard files
+    // This is valid for gzip format - multiple gzip streams can be concatenated
+    let mut output = File::create(&gz_path)?;
 
     for entry in &cdr_files {
         let file_path = entry.path();
-        let content = std::fs::read_to_string(&file_path)?;
-
-        // Write header only from first file
-        if first_file {
-            combined_file.write_all(content.as_bytes())?;
-            first_file = false;
-        } else {
-            // Skip header line for subsequent files
-            let lines: Vec<&str> = content.lines().collect();
-            if lines.len() > 1 {
-                for line in &lines[1..] {
-                    combined_file.write_all(line.as_bytes())?;
-                    combined_file.write_all(b"\n")?;
-                }
-            }
-        }
+        let mut input = File::open(&file_path)?;
+        std::io::copy(&mut input, &mut output)?;
     }
 
-    combined_file.flush()?;
-    drop(combined_file);
+    output.flush()?;
 
-    println!("Combined {} shard files into: {:?}", cdr_files.len(), combined_path);
-
-    // Compress the combined file
-    let input = File::open(&combined_path)?;
-    let mut reader = BufReader::new(input);
-    let output = File::create(&gz_path)?;
-    let mut encoder = GzEncoder::new(output, Compression::default());
-
-    std::io::copy(&mut reader, &mut encoder)?;
-    encoder.finish()?;
-
-    println!("Created compressed archive: {:?}", gz_path);
-
-    // Remove temporary combined file
-    std::fs::remove_file(&combined_path)?;
+    println!("Combined {} shard files into: {:?}", cdr_files.len(), gz_path);
 
     // Cleanup original shard files if requested
     if cleanup {
