@@ -5,8 +5,8 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
-use tar::Builder;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DailySummary {
@@ -65,7 +65,7 @@ pub fn create_daily_summary(out_dir: &Path, day: &DateTime<Tz>) -> anyhow::Resul
     Ok(summary)
 }
 
-/// Create a TAR.GZ archive for a day's worth of CDR data
+/// Combine all CDR shard files for a day and compress into a single .gz file
 pub fn bundle_day(out_dir: &Path, day: &DateTime<Tz>, cleanup: bool) -> anyhow::Result<PathBuf> {
     let day_str = day.format("%Y-%m-%d").to_string();
     let day_dir = out_dir.join(&day_str);
@@ -74,25 +74,78 @@ pub fn bundle_day(out_dir: &Path, day: &DateTime<Tz>, cleanup: bool) -> anyhow::
         anyhow::bail!("Day directory not found: {:?}", day_dir);
     }
 
-    let archive_path = out_dir.join(format!("{}.tar.gz", day_str));
+    // Collect all CDR shard files (sorted by name for consistent ordering)
+    let mut cdr_files: Vec<_> = std::fs::read_dir(&day_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            name_str.starts_with("cdr_") && name_str.ends_with(".csv")
+        })
+        .collect();
 
-    // Create tar.gz archive
-    let tar_gz = File::create(&archive_path)?;
-    let enc = GzEncoder::new(tar_gz, Compression::default());
-    let mut tar = Builder::new(enc);
+    cdr_files.sort_by_key(|entry| entry.file_name());
 
-    tar.append_dir_all(&day_str, &day_dir)?;
-    tar.finish()?;
-
-    println!("Created archive: {:?}", archive_path);
-
-    // Cleanup original files if requested
-    if cleanup {
-        std::fs::remove_dir_all(&day_dir)?;
-        println!("Cleaned up directory: {:?}", day_dir);
+    if cdr_files.is_empty() {
+        anyhow::bail!("No CDR files found in directory: {:?}", day_dir);
     }
 
-    Ok(archive_path)
+    // Create combined CDR file path
+    let combined_path = out_dir.join(format!("cdr_{}.csv", day_str));
+    let gz_path = out_dir.join(format!("cdr_{}.csv.gz", day_str));
+
+    // Combine all CDR files into one
+    let mut combined_file = File::create(&combined_path)?;
+    let mut first_file = true;
+
+    for entry in &cdr_files {
+        let file_path = entry.path();
+        let content = std::fs::read_to_string(&file_path)?;
+
+        // Write header only from first file
+        if first_file {
+            combined_file.write_all(content.as_bytes())?;
+            first_file = false;
+        } else {
+            // Skip header line for subsequent files
+            let lines: Vec<&str> = content.lines().collect();
+            if lines.len() > 1 {
+                for line in &lines[1..] {
+                    combined_file.write_all(line.as_bytes())?;
+                    combined_file.write_all(b"\n")?;
+                }
+            }
+        }
+    }
+
+    combined_file.flush()?;
+    drop(combined_file);
+
+    println!("Combined {} shard files into: {:?}", cdr_files.len(), combined_path);
+
+    // Compress the combined file
+    let input = File::open(&combined_path)?;
+    let mut reader = BufReader::new(input);
+    let output = File::create(&gz_path)?;
+    let mut encoder = GzEncoder::new(output, Compression::default());
+
+    std::io::copy(&mut reader, &mut encoder)?;
+    encoder.finish()?;
+
+    println!("Created compressed archive: {:?}", gz_path);
+
+    // Remove temporary combined file
+    std::fs::remove_file(&combined_path)?;
+
+    // Cleanup original shard files if requested
+    if cleanup {
+        for entry in &cdr_files {
+            std::fs::remove_file(entry.path())?;
+        }
+        println!("Cleaned up {} shard files", cdr_files.len());
+    }
+
+    Ok(gz_path)
 }
 
 #[cfg(test)]
@@ -136,13 +189,24 @@ mod tests {
         let day_dir = dir.path().join(&day_str);
         fs::create_dir_all(&day_dir).unwrap();
 
-        // Create a dummy file
-        fs::write(day_dir.join("test.txt"), "test content").unwrap();
+        // Create dummy CDR shard files
+        fs::write(
+            day_dir.join("cdr_2025-01-01_shard000_part001.csv"),
+            "header1;header2\ndata1;data2\n",
+        )
+        .unwrap();
+        fs::write(
+            day_dir.join("cdr_2025-01-01_shard001_part001.csv"),
+            "header1;header2\ndata3;data4\n",
+        )
+        .unwrap();
 
-        let archive_path = bundle_day(dir.path(), &day, false).unwrap();
-        assert!(archive_path.exists());
-        assert!(archive_path.to_string_lossy().ends_with(".tar.gz"));
-        assert!(day_dir.exists()); // Should still exist when cleanup=false
+        let gz_path = bundle_day(dir.path(), &day, false).unwrap();
+        assert!(gz_path.exists());
+        assert!(gz_path.to_string_lossy().ends_with(".csv.gz"));
+        // Original shard files should still exist when cleanup=false
+        assert!(day_dir.join("cdr_2025-01-01_shard000_part001.csv").exists());
+        assert!(day_dir.join("cdr_2025-01-01_shard001_part001.csv").exists());
     }
 
     #[test]
@@ -155,11 +219,23 @@ mod tests {
         let day_dir = dir.path().join(&day_str);
         fs::create_dir_all(&day_dir).unwrap();
 
-        // Create a dummy file
-        fs::write(day_dir.join("test.txt"), "test content").unwrap();
+        // Create dummy CDR shard files
+        fs::write(
+            day_dir.join("cdr_2025-01-01_shard000_part001.csv"),
+            "header1;header2\ndata1;data2\n",
+        )
+        .unwrap();
+        fs::write(
+            day_dir.join("cdr_2025-01-01_shard001_part001.csv"),
+            "header1;header2\ndata3;data4\n",
+        )
+        .unwrap();
 
-        let archive_path = bundle_day(dir.path(), &day, true).unwrap();
-        assert!(archive_path.exists());
-        assert!(!day_dir.exists()); // Should be deleted when cleanup=true
+        let gz_path = bundle_day(dir.path(), &day, true).unwrap();
+        assert!(gz_path.exists());
+        assert!(gz_path.to_string_lossy().ends_with(".csv.gz"));
+        // Original shard files should be deleted when cleanup=true
+        assert!(!day_dir.join("cdr_2025-01-01_shard000_part001.csv").exists());
+        assert!(!day_dir.join("cdr_2025-01-01_shard001_part001.csv").exists());
     }
 }
