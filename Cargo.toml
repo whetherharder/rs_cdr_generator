@@ -47,6 +47,7 @@ num_cpus = "1.16"
 # Testing
 [dev-dependencies]
 tempfile = "3.8"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bin]]
 name = "rs_cdr_generator"
@@ -58,3 +59,19 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Profile for benchmarking with criterion
+[profile.bench]
+inherits = "release"
+debug = true
+
+# Profile for flamegraph and detailed profiling
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+
+# Benchmark configurations
+[[bench]]
+name = "cdr_benchmark"
+harness = false

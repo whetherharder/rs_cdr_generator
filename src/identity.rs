@@ -2,12 +2,12 @@
 use rand::Rng;
 use rand::rngs::StdRng;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Subscriber {
-    pub msisdn: String,
-    pub imsi: String,
-    pub mccmnc: String,
-    pub imei: String,
+    pub msisdn: u64,  // Numeric MSISDN (e.g., 31612345678)
+    pub imsi: u64,    // Numeric IMSI
+    pub mccmnc: u32,  // Numeric MCCMNC (e.g., 20408)
+    pub imei: u64,    // Numeric IMEI (15 digits fits in u64)
 }
 
 #[derive(Debug, Clone)]
@@ -18,17 +18,20 @@ pub struct Contacts {
 
 /// Generate a valid 15-digit IMEI with Luhn checksum
 /// Format: TAC (8 digits) + SNR (6 digits) + check digit
-pub fn gen_imei(rng: &mut StdRng) -> String {
+/// Returns numeric IMEI as u64
+pub fn gen_imei(rng: &mut StdRng) -> u64 {
     // Generate first 14 digits
-    let tac = rng.gen_range(10_000_000..100_000_000); // 8 digits
-    let snr = rng.gen_range(100_000..1_000_000);      // 6 digits
-    let base = format!("{}{}", tac, snr);
+    let tac = rng.gen_range(10_000_000u64..100_000_000u64); // 8 digits
+    let snr = rng.gen_range(100_000u64..1_000_000u64);      // 6 digits
+    let base = tac * 1_000_000 + snr;
 
     // Calculate Luhn check digit
     let mut total = 0;
-    for (i, digit) in base.chars().enumerate() {
-        let mut d = digit.to_digit(10).unwrap() as i32;
-        if i % 2 == 1 {  // Every second digit from right (1, 3, 5...)
+    let mut temp = base;
+    for i in 0..14 {
+        let mut d = (temp % 10) as i32;
+        temp /= 10;
+        if i % 2 == 1 {  // Every second digit from right
             d *= 2;
             if d > 9 {
                 d -= 9;
@@ -38,11 +41,12 @@ pub fn gen_imei(rng: &mut StdRng) -> String {
     }
 
     let check = (10 - (total % 10)) % 10;
-    format!("{}{}", base, check)
+    base * 10 + check as u64
 }
 
 /// Build stable subscriber identities
 /// Each subscriber gets consistent MSISDN ↔ IMSI ↔ MCCMNC ↔ IMEI
+/// Note: prefixes and mccmnc_pool are now expected to be numeric strings
 pub fn build_subscribers(
     n_users: usize,
     prefixes: &[String],
@@ -52,13 +56,17 @@ pub fn build_subscribers(
     let mut subs = Vec::with_capacity(n_users);
 
     for _ in 0..n_users {
-        let prefix = &prefixes[rng.gen_range(0..prefixes.len())];
-        let subscriber_number = rng.gen_range(0..10_000_000);
-        let msisdn = format!("{}{:07}", prefix, subscriber_number);
+        // Parse prefix to u64 and append subscriber number
+        let prefix_str = &prefixes[rng.gen_range(0..prefixes.len())];
+        let prefix_num: u64 = prefix_str.parse().unwrap_or(31612);
+        let subscriber_number = rng.gen_range(0..10_000_000u64);
+        let msisdn = prefix_num * 10_000_000 + subscriber_number;
 
-        let mccmnc = mccmnc_pool[rng.gen_range(0..mccmnc_pool.len())].clone();
+        // Parse MCCMNC to u32 and append MSIN
+        let mccmnc_str = &mccmnc_pool[rng.gen_range(0..mccmnc_pool.len())];
+        let mccmnc: u32 = mccmnc_str.parse().unwrap_or(20408);
         let msin = rng.gen_range(0..10_000_000_000u64);  // 10 digits
-        let imsi = format!("{}{:010}", mccmnc, msin);
+        let imsi = (mccmnc as u64) * 10_000_000_000 + msin;
 
         let imei = gen_imei(rng);
 
@@ -131,8 +139,9 @@ mod tests {
     fn test_gen_imei() {
         let mut rng = StdRng::seed_from_u64(42);
         let imei = gen_imei(&mut rng);
-        assert_eq!(imei.len(), 15);
-        assert!(imei.chars().all(|c| c.is_ascii_digit()));
+        // IMEI should be 15 digits (fits in u64)
+        assert!(imei >= 100_000_000_000_000);
+        assert!(imei < 1_000_000_000_000_000);
     }
 
     #[test]
@@ -145,9 +154,13 @@ mod tests {
         assert_eq!(subs.len(), 10);
 
         for sub in &subs {
-            assert_eq!(sub.imei.len(), 15);
-            assert!(sub.imsi.len() >= 12);
-            assert!(sub.msisdn.starts_with("316"));
+            // Check IMEI is 15 digits
+            assert!(sub.imei >= 100_000_000_000_000);
+            assert!(sub.imei < 1_000_000_000_000_000);
+            // Check MSISDN starts with 316
+            assert!(sub.msisdn >= 31612_0000000 && sub.msisdn < 31614_0000000);
+            // Check MCCMNC is valid
+            assert!(sub.mccmnc == 20408 || sub.mccmnc == 20416);
         }
     }
 

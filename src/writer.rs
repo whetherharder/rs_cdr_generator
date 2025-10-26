@@ -7,58 +7,168 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
+// EventRow with primitive types for zero-copy performance
+// Serde will handle conversion to strings during serialization
 #[derive(Debug, Serialize)]
 pub struct EventRow {
-    pub event_type: String,
-    pub msisdn_src: String,
-    pub msisdn_dst: String,
-    pub direction: String,
+    #[serde(serialize_with = "serialize_str")]
+    pub event_type: &'static str,
+    #[serde(serialize_with = "serialize_u64")]
+    pub msisdn_src: u64,
+    #[serde(serialize_with = "serialize_u64")]
+    pub msisdn_dst: u64,
+    #[serde(serialize_with = "serialize_str")]
+    pub direction: &'static str,
     pub start_ts_ms: i64,
     pub end_ts_ms: i64,
-    pub tz_name: String,
+    #[serde(serialize_with = "serialize_str")]
+    pub tz_name: &'static str,
     pub tz_offset_min: i32,
     pub duration_sec: i64,
-    pub mccmnc: String,
-    pub imsi: String,
-    pub imei: String,
+    #[serde(serialize_with = "serialize_u32")]
+    pub mccmnc: u32,
+    #[serde(serialize_with = "serialize_u64")]
+    pub imsi: u64,
+    #[serde(serialize_with = "serialize_u64")]
+    pub imei: u64,
     pub cell_id: u32,
-    pub record_type: String,
-    pub cause_for_record_closing: String,
-    pub sms_segments: String,
-    pub sms_status: String,
-    pub data_bytes_in: String,
-    pub data_bytes_out: String,
-    pub data_duration_sec: String,
-    pub apn: String,
-    pub rat: String,
+    #[serde(serialize_with = "serialize_str")]
+    pub record_type: &'static str,
+    #[serde(serialize_with = "serialize_str")]
+    pub cause_for_record_closing: &'static str,
+    #[serde(serialize_with = "serialize_u32_or_empty")]
+    pub sms_segments: u32,
+    #[serde(serialize_with = "serialize_str")]
+    pub sms_status: &'static str,
+    #[serde(serialize_with = "serialize_u64_or_empty")]
+    pub data_bytes_in: u64,
+    #[serde(serialize_with = "serialize_u64_or_empty")]
+    pub data_bytes_out: u64,
+    #[serde(serialize_with = "serialize_i64_or_empty")]
+    pub data_duration_sec: i64,
+    #[serde(serialize_with = "serialize_str")]
+    pub apn: &'static str,
+    #[serde(serialize_with = "serialize_str")]
+    pub rat: &'static str,
+}
+
+// Custom serializers for efficient conversion
+fn serialize_str<S>(value: &&str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(value)
+}
+
+fn serialize_u64<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if *value == 0 {
+        serializer.serialize_str("")
+    } else {
+        serializer.serialize_str(&value.to_string())
+    }
+}
+
+fn serialize_u32<S>(value: &u32, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if *value == 0 {
+        serializer.serialize_str("")
+    } else {
+        serializer.serialize_str(&value.to_string())
+    }
+}
+
+fn serialize_u64_or_empty<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if *value == 0 {
+        serializer.serialize_str("")
+    } else {
+        serializer.serialize_str(&value.to_string())
+    }
+}
+
+fn serialize_u32_or_empty<S>(value: &u32, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if *value == 0 {
+        serializer.serialize_str("")
+    } else {
+        serializer.serialize_str(&value.to_string())
+    }
+}
+
+fn serialize_i64_or_empty<S>(value: &i64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if *value == 0 {
+        serializer.serialize_str("")
+    } else {
+        serializer.serialize_str(&value.to_string())
+    }
 }
 
 impl Default for EventRow {
     fn default() -> Self {
         EventRow {
-            event_type: String::new(),
-            msisdn_src: String::new(),
-            msisdn_dst: String::new(),
-            direction: String::new(),
+            event_type: "",
+            msisdn_src: 0,
+            msisdn_dst: 0,
+            direction: "",
             start_ts_ms: 0,
             end_ts_ms: 0,
-            tz_name: String::new(),
+            tz_name: "",
             tz_offset_min: 0,
             duration_sec: 0,
-            mccmnc: String::new(),
-            imsi: String::new(),
-            imei: String::new(),
+            mccmnc: 0,
+            imsi: 0,
+            imei: 0,
             cell_id: 0,
-            record_type: String::new(),
-            cause_for_record_closing: String::new(),
-            sms_segments: String::new(),
-            sms_status: String::new(),
-            data_bytes_in: String::new(),
-            data_bytes_out: String::new(),
-            data_duration_sec: String::new(),
-            apn: String::new(),
-            rat: String::new(),
+            record_type: "",
+            cause_for_record_closing: "",
+            sms_segments: 0,
+            sms_status: "",
+            data_bytes_in: 0,
+            data_bytes_out: 0,
+            data_duration_sec: 0,
+            apn: "",
+            rat: "",
         }
+    }
+}
+
+impl EventRow {
+    /// Reset all fields to default values for object pool reuse
+    pub fn reset(&mut self) {
+        self.event_type = "";
+        self.msisdn_src = 0;
+        self.msisdn_dst = 0;
+        self.direction = "";
+        self.start_ts_ms = 0;
+        self.end_ts_ms = 0;
+        self.tz_name = "";
+        self.tz_offset_min = 0;
+        self.duration_sec = 0;
+        self.mccmnc = 0;
+        self.imsi = 0;
+        self.imei = 0;
+        self.cell_id = 0;
+        self.record_type = "";
+        self.cause_for_record_closing = "";
+        self.sms_segments = 0;
+        self.sms_status = "";
+        self.data_bytes_in = 0;
+        self.data_bytes_out = 0;
+        self.data_duration_sec = 0;
+        self.apn = "";
+        self.rat = "";
     }
 }
 

@@ -23,3 +23,16 @@ Thumbs.db
 # Temporary
 tmp/
 temp/
+
+# Benchmarking and profiling results
+benchmark_results/
+profiling_results/
+benchmark_test/
+flamegraph_temp/
+*.trace
+perf.data
+perf.data.old
+*.svg
+*.txt
+!PROFILING.md
+!README.md

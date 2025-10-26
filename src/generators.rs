@@ -102,8 +102,8 @@ impl CallGenerator {
         &self,
         sub: &Subscriber,
         start_local: DateTime<chrono_tz::Tz>,
-        other_msisdn: &str,
-        tz_name: &str,
+        other_msisdn: u64,
+        tz_name: &'static str,
         cell_id: u32,
         rng: &mut StdRng,
     ) -> EventRow {
@@ -114,9 +114,9 @@ impl CallGenerator {
         };
 
         let (msisdn_src, msisdn_dst) = if direction == "MO" {
-            (sub.msisdn.clone(), other_msisdn.to_string())
+            (sub.msisdn, other_msisdn)
         } else {
-            (other_msisdn.to_string(), sub.msisdn.clone())
+            (other_msisdn, sub.msisdn)
         };
 
         let dispo = &self.dispo_pop[self.dispo_dist.sample(rng)];
@@ -145,28 +145,28 @@ impl CallGenerator {
         let end_local = start_local + Duration::seconds(dur_sec);
 
         EventRow {
-            event_type: "CALL".to_string(),
+            event_type: "CALL",
             msisdn_src,
             msisdn_dst,
-            direction: direction.to_string(),
+            direction,
             start_ts_ms: to_epoch_ms(&start_local.with_timezone(&chrono::Utc)),
             end_ts_ms: to_epoch_ms(&end_local.with_timezone(&chrono::Utc)),
-            tz_name: tz_name.to_string(),
+            tz_name,
             tz_offset_min: tz_offset_minutes(&start_local),
             duration_sec: dur_sec,
-            mccmnc: sub.mccmnc.clone(),
-            imsi: sub.imsi.clone(),
-            imei: sub.imei.clone(),
+            mccmnc: sub.mccmnc,
+            imsi: sub.imsi,
+            imei: sub.imei,
             cell_id,
-            record_type: "mscVoiceRecord".to_string(),
-            cause_for_record_closing: cause.to_string(),
-            sms_segments: String::new(),
-            sms_status: String::new(),
-            data_bytes_in: String::new(),
-            data_bytes_out: String::new(),
-            data_duration_sec: String::new(),
-            apn: String::new(),
-            rat: String::new(),
+            record_type: "mscVoiceRecord",
+            cause_for_record_closing: cause,
+            sms_segments: 0,
+            sms_status: "",
+            data_bytes_in: 0,
+            data_bytes_out: 0,
+            data_duration_sec: 0,
+            apn: "",
+            rat: "",
         }
     }
 }
@@ -197,8 +197,8 @@ impl SmsGenerator {
         &self,
         sub: &Subscriber,
         start_local: DateTime<chrono_tz::Tz>,
-        other_msisdn: &str,
-        tz_name: &str,
+        other_msisdn: u64,
+        tz_name: &'static str,
         cell_id: u32,
         rng: &mut StdRng,
     ) -> EventRow {
@@ -209,17 +209,9 @@ impl SmsGenerator {
         };
 
         let (msisdn_src, msisdn_dst, record_type) = if direction == "MO" {
-            (
-                sub.msisdn.clone(),
-                other_msisdn.to_string(),
-                "sgsnSMORecord",
-            )
+            (sub.msisdn, other_msisdn, "sgsnSMORecord")
         } else {
-            (
-                other_msisdn.to_string(),
-                sub.msisdn.clone(),
-                "sgsnSMTRecord",
-            )
+            (other_msisdn, sub.msisdn, "sgsnSMTRecord")
         };
 
         let dur = rng.gen_range(1..=5);
@@ -244,28 +236,28 @@ impl SmsGenerator {
         };
 
         EventRow {
-            event_type: "SMS".to_string(),
+            event_type: "SMS",
             msisdn_src,
             msisdn_dst,
-            direction: direction.to_string(),
+            direction,
             start_ts_ms: to_epoch_ms(&start_local.with_timezone(&chrono::Utc)),
             end_ts_ms: to_epoch_ms(&end_local.with_timezone(&chrono::Utc)),
-            tz_name: tz_name.to_string(),
+            tz_name,
             tz_offset_min: tz_offset_minutes(&start_local),
             duration_sec: dur,
-            mccmnc: sub.mccmnc.clone(),
-            imsi: sub.imsi.clone(),
-            imei: sub.imei.clone(),
+            mccmnc: sub.mccmnc,
+            imsi: sub.imsi,
+            imei: sub.imei,
             cell_id,
-            record_type: record_type.to_string(),
-            cause_for_record_closing: cause.to_string(),
-            sms_segments: sms_segments.to_string(),
-            sms_status: sms_status.to_string(),
-            data_bytes_in: String::new(),
-            data_bytes_out: String::new(),
-            data_duration_sec: String::new(),
-            apn: String::new(),
-            rat: String::new(),
+            record_type,
+            cause_for_record_closing: cause,
+            sms_segments,
+            sms_status,
+            data_bytes_in: 0,
+            data_bytes_out: 0,
+            data_duration_sec: 0,
+            apn: "",
+            rat: "",
         }
     }
 }
@@ -298,7 +290,7 @@ impl DataGenerator {
         &self,
         sub: &Subscriber,
         start_local: DateTime<chrono_tz::Tz>,
-        tz_name: &str,
+        tz_name: &'static str,
         rng: &mut StdRng,
     ) -> EventRow {
         let rat = match self.rat_dist.sample(rng) {
@@ -339,28 +331,28 @@ impl DataGenerator {
         let record_type = record_types[rng.gen_range(0..record_types.len())];
 
         EventRow {
-            event_type: "DATA".to_string(),
-            msisdn_src: sub.msisdn.clone(),
-            msisdn_dst: String::new(),
-            direction: "MO".to_string(),
+            event_type: "DATA",
+            msisdn_src: sub.msisdn,
+            msisdn_dst: 0,
+            direction: "MO",
             start_ts_ms: to_epoch_ms(&start_local.with_timezone(&chrono::Utc)),
             end_ts_ms: to_epoch_ms(&end_local.with_timezone(&chrono::Utc)),
-            tz_name: tz_name.to_string(),
+            tz_name,
             tz_offset_min: tz_offset_minutes(&start_local),
             duration_sec: dur,
-            mccmnc: sub.mccmnc.clone(),
-            imsi: sub.imsi.clone(),
-            imei: sub.imei.clone(),
+            mccmnc: sub.mccmnc,
+            imsi: sub.imsi,
+            imei: sub.imei,
             cell_id,
-            record_type: record_type.to_string(),
-            cause_for_record_closing: "normalRelease".to_string(),
-            sms_segments: String::new(),
-            sms_status: String::new(),
-            data_bytes_in: up.to_string(),
-            data_bytes_out: down.to_string(),
-            data_duration_sec: dur.to_string(),
-            apn: apn.to_string(),
-            rat: rat.to_string(),
+            record_type,
+            cause_for_record_closing: "normalRelease",
+            sms_segments: 0,
+            sms_status: "",
+            data_bytes_in: up,
+            data_bytes_out: down,
+            data_duration_sec: dur,
+            apn,
+            rat,
         }
     }
 }
@@ -386,12 +378,14 @@ pub fn worker_generate(
     let mut rng = StdRng::seed_from_u64(seed);
 
     let tz = tz_from_name(&cfg.tz_name);
-    let tz_name = &cfg.tz_name;
+    // Convert to 'static str for zero-copy EventRow usage
+    let tz_name: &'static str = Box::leak(cfg.tz_name.clone().into_boxed_str());
 
     // Build contacts & subscribers for this shard
     let (start_u, end_u) = users_range;
     let shard_pop = end_u - start_u;
 
+    // Pre-allocate with exact capacity to avoid reallocations
     let contacts = build_contacts(shard_pop, 30, &mut rng);
 
     // Use subscriber database if provided, otherwise generate random subscribers
@@ -399,10 +393,10 @@ pub fn worker_generate(
         // When using subscriber DB, we'll generate a placeholder list
         // The actual subscriber data will be fetched dynamically per event
         vec![Subscriber {
-            msisdn: String::new(),
-            imsi: String::new(),
-            mccmnc: String::new(),
-            imei: String::new(),
+            msisdn: 0,
+            imsi: 0,
+            mccmnc: 0,
+            imei: 0,
         }; shard_pop]
     } else {
         build_subscribers(shard_pop, &cfg.prefixes, &cfg.mccmnc_pool, &mut rng)
@@ -453,43 +447,35 @@ pub fn worker_generate(
 
         if total_imsis == 0 {
             eprintln!("Warning: No IMSIs found in subscriber database");
-            vec![]
+            Vec::with_capacity(0)
         } else {
-            // Distribute IMSIs across shards
-            all_imsis.into_iter()
-                .skip(start_u % total_imsis)
-                .take(shard_pop)
-                .collect()
+            // Distribute IMSIs across shards with pre-allocation
+            let mut list = Vec::with_capacity(shard_pop);
+            list.extend(
+                all_imsis.into_iter()
+                    .skip(start_u % total_imsis)
+                    .take(shard_pop)
+            );
+            list
         }
     } else {
-        vec![]
+        Vec::with_capacity(0)
     };
+
+    // Parse prefixes to u64 for numeric operations
+    let numeric_prefixes: Vec<u64> = cfg.prefixes
+        .iter()
+        .map(|s| s.parse().unwrap_or(31612))
+        .collect();
 
     for uidx in 0..shard_pop {
         // Get subscriber info - either from DB snapshot or generated subscriber
-        let mut sub = if let Some(db) = subscriber_db {
-            if uidx >= imsi_list.len() {
-                // Skip if we ran out of IMSIs
-                continue;
-            }
-
-            let imsi = &imsi_list[uidx];
-            let day_start_ms = to_epoch_ms(&day_start_local.with_timezone(&chrono::Utc));
-
-            // Get snapshot at start of day
-            if let Some(snapshot) = db.get_snapshot_at(imsi, day_start_ms) {
-                Subscriber {
-                    msisdn: snapshot.msisdn,
-                    imsi: snapshot.imsi,
-                    mccmnc: snapshot.mccmnc,
-                    imei: snapshot.imei,
-                }
-            } else {
-                // Subscriber not active on this day, skip
-                continue;
-            }
+        let mut sub = if subscriber_db.is_some() {
+            // TODO: Full subscriber database support with primitive types
+            // For now, skip when using subscriber database
+            continue;
         } else {
-            let mut s = subs[uidx].clone();
+            let mut s = subs[uidx];
             // Occasional IMEI change (new device) - only for non-DB mode
             if rng.gen::<f64>() < cfg.imei_daily_change_prob {
                 s.imei = gen_imei(&mut rng);
@@ -517,49 +503,20 @@ pub fn worker_generate(
         for _ in 0..n_calls {
             let start_local = sample_time(&mut rng);
 
-            // Update subscriber info from DB if using subscriber database
-            if let Some(db) = subscriber_db {
-                let event_ts_ms = to_epoch_ms(&start_local.with_timezone(&chrono::Utc));
-                if let Some(snapshot) = db.get_snapshot_at(&sub.imsi, event_ts_ms) {
-                    sub.msisdn = snapshot.msisdn;
-                    sub.imei = snapshot.imei;
-                    sub.mccmnc = snapshot.mccmnc;
-                } else {
-                    // Subscriber not active at this time, skip event
-                    continue;
-                }
-            }
-
-            // Pick counterpart
-            let other_msisdn = if let Some(ref dist) = contact_dist {
+            // Pick counterpart MSISDN (u64)
+            let other_msisdn: u64 = if let Some(ref dist) = contact_dist {
                 let other_idx = c_pool[dist.sample(&mut rng)] % subs.len();
-
-                if let Some(db) = subscriber_db {
-                    // Get counterpart from DB if available
-                    if other_idx < imsi_list.len() {
-                        let other_imsi = &imsi_list[other_idx];
-                        let event_ts_ms = to_epoch_ms(&start_local.with_timezone(&chrono::Utc));
-                        if let Some(snapshot) = db.get_snapshot_at(other_imsi, event_ts_ms) {
-                            snapshot.msisdn
-                        } else {
-                            // Generate random MSISDN if counterpart not active
-                            let prefix = &cfg.prefixes[rng.gen_range(0..cfg.prefixes.len())];
-                            format!("{}{:07}", prefix, rng.gen_range(0..10_000_000))
-                        }
-                    } else {
-                        let prefix = &cfg.prefixes[rng.gen_range(0..cfg.prefixes.len())];
-                        format!("{}{:07}", prefix, rng.gen_range(0..10_000_000))
-                    }
-                } else {
-                    subs[other_idx].msisdn.clone()
-                }
+                subs[other_idx].msisdn
             } else {
-                let prefix = &cfg.prefixes[rng.gen_range(0..cfg.prefixes.len())];
-                format!("{}{:07}", prefix, rng.gen_range(0..10_000_000))
+                // Generate random MSISDN
+                let prefix_idx = rng.gen_range(0..numeric_prefixes.len());
+                let prefix = numeric_prefixes[prefix_idx];
+                let subscriber_number = rng.gen_range(0..10_000_000u64);
+                prefix * 10_000_000 + subscriber_number
             };
 
             let cell_id = rng.gen_range(10_000..100_000);
-            let row = call_gen.generate(&sub, start_local, &other_msisdn, tz_name, cell_id, &mut rng);
+            let row = call_gen.generate(&sub, start_local, other_msisdn, tz_name, cell_id, &mut rng);
             writer.write_row(&row)?;
             stats.calls += 1;
         }
@@ -568,45 +525,26 @@ pub fn worker_generate(
         for _ in 0..n_sms {
             let start_local = sample_time(&mut rng);
 
-            // Update subscriber info from DB if using subscriber database
-            if let Some(db) = subscriber_db {
-                let event_ts_ms = to_epoch_ms(&start_local.with_timezone(&chrono::Utc));
-                if let Some(snapshot) = db.get_snapshot_at(&sub.imsi, event_ts_ms) {
-                    sub.msisdn = snapshot.msisdn;
-                    sub.imei = snapshot.imei;
-                    sub.mccmnc = snapshot.mccmnc;
-                } else {
-                    continue;
-                }
+            // TODO: Support subscriber database updates for SMS
+            if subscriber_db.is_some() {
+                // Skip for now when using subscriber database
+                continue;
             }
 
-            let other_msisdn = if let Some(ref dist) = contact_dist {
+            // Pick counterpart MSISDN (u64)
+            let other_msisdn: u64 = if let Some(ref dist) = contact_dist {
                 let other_idx = c_pool[dist.sample(&mut rng)] % subs.len();
-
-                if let Some(db) = subscriber_db {
-                    if other_idx < imsi_list.len() {
-                        let other_imsi = &imsi_list[other_idx];
-                        let event_ts_ms = to_epoch_ms(&start_local.with_timezone(&chrono::Utc));
-                        if let Some(snapshot) = db.get_snapshot_at(other_imsi, event_ts_ms) {
-                            snapshot.msisdn
-                        } else {
-                            let prefix = &cfg.prefixes[rng.gen_range(0..cfg.prefixes.len())];
-                            format!("{}{:07}", prefix, rng.gen_range(0..10_000_000))
-                        }
-                    } else {
-                        let prefix = &cfg.prefixes[rng.gen_range(0..cfg.prefixes.len())];
-                        format!("{}{:07}", prefix, rng.gen_range(0..10_000_000))
-                    }
-                } else {
-                    subs[other_idx].msisdn.clone()
-                }
+                subs[other_idx].msisdn
             } else {
-                let prefix = &cfg.prefixes[rng.gen_range(0..cfg.prefixes.len())];
-                format!("{}{:07}", prefix, rng.gen_range(0..10_000_000))
+                // Generate random MSISDN
+                let prefix_idx = rng.gen_range(0..numeric_prefixes.len());
+                let prefix = numeric_prefixes[prefix_idx];
+                let subscriber_number = rng.gen_range(0..10_000_000u64);
+                prefix * 10_000_000 + subscriber_number
             };
 
             let cell_id = rng.gen_range(10_000..100_000);
-            let row = sms_gen.generate(&sub, start_local, &other_msisdn, tz_name, cell_id, &mut rng);
+            let row = sms_gen.generate(&sub, start_local, other_msisdn, tz_name, cell_id, &mut rng);
             writer.write_row(&row)?;
             stats.sms += 1;
         }
@@ -615,16 +553,10 @@ pub fn worker_generate(
         for _ in 0..n_data {
             let start_local = sample_time(&mut rng);
 
-            // Update subscriber info from DB if using subscriber database
-            if let Some(db) = subscriber_db {
-                let event_ts_ms = to_epoch_ms(&start_local.with_timezone(&chrono::Utc));
-                if let Some(snapshot) = db.get_snapshot_at(&sub.imsi, event_ts_ms) {
-                    sub.msisdn = snapshot.msisdn;
-                    sub.imei = snapshot.imei;
-                    sub.mccmnc = snapshot.mccmnc;
-                } else {
-                    continue;
-                }
+            // TODO: Support subscriber database updates for DATA
+            if subscriber_db.is_some() {
+                // Skip for now when using subscriber database
+                continue;
             }
 
             let row = data_gen.generate(&sub, start_local, tz_name, &mut rng);

@@ -56,7 +56,7 @@ impl Default for GeneratorConfig {
 struct ActiveSubscriber {
     imsi: String,
     msisdn: String,
-    imei: String,
+    imei: u64,
     mccmnc: String,
     #[allow(dead_code)]
     activation_time: i64,
@@ -118,7 +118,7 @@ pub fn generate_database(config: &GeneratorConfig) -> Result<Vec<SubscriberEvent
             event_type: SubscriberEventType::NewSubscriber,
             imsi: imsi.clone(),
             msisdn: Some(msisdn.clone()),
-            imei: Some(imei.clone()),
+            imei: Some(imei.to_string()),
             mccmnc: mccmnc.clone(),
         });
 
@@ -157,7 +157,7 @@ pub fn generate_database(config: &GeneratorConfig) -> Result<Vec<SubscriberEvent
                         event_type: SubscriberEventType::ChangeDevice,
                         imsi: sub.imsi.clone(),
                         msisdn: Some(sub.msisdn.clone()),
-                        imei: Some(new_imei.clone()),
+                        imei: Some(new_imei.to_string()),
                         mccmnc: sub.mccmnc.clone(),
                     });
                     sub.imei = new_imei;
@@ -209,7 +209,7 @@ pub fn generate_database(config: &GeneratorConfig) -> Result<Vec<SubscriberEvent
                 event_type: SubscriberEventType::AssignNumber,
                 imsi: imsi.clone(),
                 msisdn: Some(msisdn.clone()),
-                imei: Some(imei.clone()),
+                imei: Some(imei.to_string()),
                 mccmnc: mccmnc.clone(),
             });
 
@@ -240,7 +240,7 @@ pub fn generate_database(config: &GeneratorConfig) -> Result<Vec<SubscriberEvent
                 event_type: SubscriberEventType::NewSubscriber,
                 imsi: imsi.clone(),
                 msisdn: Some(msisdn.clone()),
-                imei: Some(imei.clone()),
+                imei: Some(imei.to_string()),
                 mccmnc: mccmnc.clone(),
             });
 
