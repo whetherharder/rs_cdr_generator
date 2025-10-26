@@ -17,6 +17,8 @@ use rayon::prelude::*;
 use rs_cdr_generator::cells::{ensure_cells_catalog, load_cells_catalog};
 use rs_cdr_generator::config::{load_config, parse_prefixes, Config};
 use rs_cdr_generator::generators::worker_generate;
+use rs_cdr_generator::subscriber_db::SubscriberDatabase;
+use rs_cdr_generator::subscriber_db_generator::{export_to_csv, generate_database, GeneratorConfig};
 use rs_cdr_generator::timezone_utils::tz_from_name;
 use rs_cdr_generator::utils::{bundle_day, create_daily_summary};
 use std::path::PathBuf;
@@ -92,6 +94,39 @@ struct Args {
     /// Удалять исходные файлы после архивации
     #[arg(long, default_value = "false")]
     cleanup_after_archive: bool,
+
+    // Subscriber database options
+    /// Путь к CSV файлу с базой абонентов
+    #[arg(long)]
+    subscriber_db: Option<PathBuf>,
+
+    /// Генерировать базу абонентов и сохранить в файл
+    #[arg(long)]
+    generate_db: Option<PathBuf>,
+
+    /// Размер генерируемой базы абонентов
+    #[arg(long)]
+    db_size: Option<usize>,
+
+    /// Период истории базы абонентов (дни)
+    #[arg(long)]
+    db_history_days: Option<usize>,
+
+    /// Вероятность смены устройства в год [0..1]
+    #[arg(long)]
+    db_device_change_rate: Option<f64>,
+
+    /// Вероятность освобождения номера в год [0..1]
+    #[arg(long)]
+    db_number_release_rate: Option<f64>,
+
+    /// Дни "остывания" номера перед переназначением
+    #[arg(long)]
+    db_cooldown_days: Option<usize>,
+
+    /// Только валидировать базу абонентов (не генерировать CDR)
+    #[arg(long, default_value = "false")]
+    validate_db: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -138,6 +173,95 @@ fn main() -> anyhow::Result<()> {
     if let Some(prob) = args.imei_change_prob {
         cfg.imei_daily_change_prob = prob.max(0.0).min(1.0);
     }
+
+    // Subscriber database options
+    cfg.subscriber_db_path = args.subscriber_db.clone();
+    cfg.generate_subscriber_db = args.generate_db.clone();
+    cfg.validate_db_only = args.validate_db;
+
+    if let Some(size) = args.db_size {
+        cfg.db_size = size;
+    }
+    if let Some(days) = args.db_history_days {
+        cfg.db_history_days = days;
+    }
+    if let Some(rate) = args.db_device_change_rate {
+        cfg.db_device_change_rate = rate.max(0.0).min(1.0);
+    }
+    if let Some(rate) = args.db_number_release_rate {
+        cfg.db_number_release_rate = rate.max(0.0).min(1.0);
+    }
+    if let Some(cooldown) = args.db_cooldown_days {
+        cfg.db_cooldown_days = cooldown;
+    }
+
+    // Handle subscriber database generation if requested
+    if let Some(ref gen_path) = cfg.generate_subscriber_db {
+        println!("Generating subscriber database...");
+
+        let gen_config = GeneratorConfig {
+            initial_subscribers: cfg.db_size,
+            history_days: cfg.db_history_days,
+            device_change_rate: cfg.db_device_change_rate,
+            number_release_rate: cfg.db_number_release_rate,
+            cooldown_days: cfg.db_cooldown_days,
+            prefixes: cfg.prefixes.clone(),
+            mccmnc_pool: cfg.mccmnc_pool.clone(),
+            seed: args.seed,
+            start_timestamp_ms: 1704067200000, // 2024-01-01
+        };
+
+        let events = generate_database(&gen_config)?;
+        export_to_csv(&events, gen_path)?;
+
+        println!("Subscriber database generated successfully!");
+
+        // If only generation was requested (no CDR generation), exit
+        if cfg.subscriber_db_path.is_none() && !cfg.validate_db_only {
+            return Ok(());
+        }
+    }
+
+    // Handle subscriber database validation if requested
+    if cfg.validate_db_only {
+        if let Some(ref db_path) = cfg.subscriber_db_path {
+            println!("Loading subscriber database from {:?}...", db_path);
+            let db = SubscriberDatabase::load_from_csv(db_path)?;
+
+            println!("Validating database...");
+            db.validate()?;
+
+            println!("✓ Database validation passed!");
+            println!("  Events: {}", db.event_count());
+            println!("  Unique IMSI: {}", db.unique_imsi_count());
+
+            return Ok(());
+        } else {
+            eprintln!("Error: --validate-db requires --subscriber-db <path>");
+            std::process::exit(1);
+        }
+    }
+
+    // Load subscriber database if provided
+    let _subscriber_db = if let Some(ref db_path) = cfg.subscriber_db_path {
+        println!("Loading subscriber database from {:?}...", db_path);
+        let mut db = SubscriberDatabase::load_from_csv(db_path)?;
+
+        println!("Validating database...");
+        db.validate()?;
+
+        println!("Building snapshots for fast lookup...");
+        db.build_snapshots();
+
+        println!("✓ Subscriber database loaded:");
+        println!("  Events: {}", db.event_count());
+        println!("  Snapshots: {}", db.snapshot_count());
+        println!("  Unique IMSI: {}", db.unique_imsi_count());
+
+        Some(db)
+    } else {
+        None
+    };
 
     // Parse cell center from CLI or use config values
     let (center_lat, center_lon) = if let Some(ref cell_center_str) = args.cell_center {

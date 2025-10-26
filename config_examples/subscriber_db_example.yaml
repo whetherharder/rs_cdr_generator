@@ -1,0 +1,83 @@
+# Example configuration for subscriber database generation
+#
+# This configuration demonstrates how to set up subscriber database
+# parameters for realistic telecom scenarios.
+
+# =============================================================================
+# SUBSCRIBER DATABASE PARAMETERS
+# =============================================================================
+
+# Size of the subscriber database
+# Number of initial subscribers when generation starts
+db_size: 10000
+
+# History period in days
+# How far back in time should the subscriber history go
+db_history_days: 365
+
+# Device change rate (annual probability: 0.0 - 1.0)
+# Percentage of subscribers who change their device (IMEI) per year
+# Example: 0.15 = 15% of subscribers change devices annually
+# Typical values: 0.10 - 0.25 (10% - 25% per year)
+db_device_change_rate: 0.15
+
+# Number release rate (annual probability: 0.0 - 1.0)
+# Percentage of subscribers who release their phone number per year
+# Example: 0.05 = 5% of subscribers release numbers annually
+# Typical values: 0.03 - 0.10 (3% - 10% per year)
+db_number_release_rate: 0.05
+
+# Cooldown period in days
+# Number of days a released phone number waits before being reassigned
+# Regulatory requirements often mandate 30-180 days
+# Typical values: 60 - 180 days
+db_cooldown_days: 90
+
+# =============================================================================
+# STANDARD CDR GENERATION PARAMETERS
+# =============================================================================
+
+# Population
+subscribers: 10000
+cells: 2000
+
+# Phone number prefixes (without country code)
+prefixes:
+  - "31612"
+  - "31613"
+  - "31620"
+
+# Mobile Country Code + Mobile Network Code
+mccmnc_pool:
+  - "20408"  # Netherlands - KPN
+  - "20416"  # Netherlands - T-Mobile
+  - "20420"  # Netherlands - Vodafone
+
+# Event rates (per user per day)
+avg_calls_per_user: 3.5
+avg_sms_per_user: 5.2
+avg_data_sessions_per_user: 12.0
+
+# Timezone
+tz_name: "Europe/Amsterdam"
+
+# File rotation
+rotate_bytes: 100000000  # 100 MB
+
+# Number of parallel workers (0 = auto-detect)
+workers: 0
+
+# =============================================================================
+# USAGE EXAMPLES
+# =============================================================================
+#
+# 1. Generate subscriber database:
+#    ./rs_cdr_generator --config subscriber_db_example.yaml --generate-db subs.csv
+#
+# 2. Validate subscriber database:
+#    ./rs_cdr_generator --subscriber-db subs.csv --validate-db
+#
+# 3. Generate CDR with subscriber database:
+#    ./rs_cdr_generator --config subscriber_db_example.yaml \
+#      --subscriber-db subs.csv --start 2025-01-01 --days 7
+#

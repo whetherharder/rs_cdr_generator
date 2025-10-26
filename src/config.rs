@@ -1,7 +1,7 @@
 // Configuration management for CDR generator
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_TZ_NAME: &str = "Europe/Amsterdam";
 
@@ -57,6 +57,16 @@ pub struct Config {
 
     // Multiprocessing
     pub workers: usize,
+
+    // Subscriber database
+    pub subscriber_db_path: Option<PathBuf>,
+    pub generate_subscriber_db: Option<PathBuf>,
+    pub db_size: usize,
+    pub db_history_days: usize,
+    pub db_device_change_rate: f64,
+    pub db_number_release_rate: f64,
+    pub db_cooldown_days: usize,
+    pub validate_db_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +146,14 @@ impl Default for Config {
             rotate_bytes: 100_000_000,
             tz_name: DEFAULT_TZ_NAME.to_string(),
             workers: 0,
+            subscriber_db_path: None,
+            generate_subscriber_db: None,
+            db_size: 10_000,
+            db_history_days: 365,
+            db_device_change_rate: 0.15,
+            db_number_release_rate: 0.05,
+            db_cooldown_days: 90,
+            validate_db_only: false,
         }
     }
 }
@@ -271,6 +289,31 @@ fn merge_config_value(config: &mut Config, key: &str, value: serde_yaml::Value) 
         "rotate_bytes" => {
             if let Some(v) = value.as_u64() {
                 config.rotate_bytes = v;
+            }
+        }
+        "db_size" => {
+            if let Some(v) = value.as_u64() {
+                config.db_size = v as usize;
+            }
+        }
+        "db_history_days" => {
+            if let Some(v) = value.as_u64() {
+                config.db_history_days = v as usize;
+            }
+        }
+        "db_device_change_rate" => {
+            if let Some(v) = value.as_f64() {
+                config.db_device_change_rate = v;
+            }
+        }
+        "db_number_release_rate" => {
+            if let Some(v) = value.as_f64() {
+                config.db_number_release_rate = v;
+            }
+        }
+        "db_cooldown_days" => {
+            if let Some(v) = value.as_u64() {
+                config.db_cooldown_days = v as usize;
             }
         }
         _ => {}
