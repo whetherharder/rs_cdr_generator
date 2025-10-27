@@ -65,7 +65,8 @@ where
     if *value == 0 {
         serializer.serialize_str("")
     } else {
-        serializer.serialize_str(&value.to_string())
+        let mut buf = itoa::Buffer::new();
+        serializer.serialize_str(buf.format(*value))
     }
 }
 
@@ -76,7 +77,8 @@ where
     if *value == 0 {
         serializer.serialize_str("")
     } else {
-        serializer.serialize_str(&value.to_string())
+        let mut buf = itoa::Buffer::new();
+        serializer.serialize_str(buf.format(*value))
     }
 }
 
@@ -87,7 +89,8 @@ where
     if *value == 0 {
         serializer.serialize_str("")
     } else {
-        serializer.serialize_str(&value.to_string())
+        let mut buf = itoa::Buffer::new();
+        serializer.serialize_str(buf.format(*value))
     }
 }
 
@@ -98,7 +101,8 @@ where
     if *value == 0 {
         serializer.serialize_str("")
     } else {
-        serializer.serialize_str(&value.to_string())
+        let mut buf = itoa::Buffer::new();
+        serializer.serialize_str(buf.format(*value))
     }
 }
 
@@ -109,7 +113,8 @@ where
     if *value == 0 {
         serializer.serialize_str("")
     } else {
-        serializer.serialize_str(&value.to_string())
+        let mut buf = itoa::Buffer::new();
+        serializer.serialize_str(buf.format(*value))
     }
 }
 

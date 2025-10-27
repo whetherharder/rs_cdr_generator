@@ -25,6 +25,10 @@ serde_yaml = "0.9"
 # CSV handling
 csv = "1.3"
 
+# Fast number-to-string conversion without allocations
+itoa = "1.0"
+ryu = "1.0"
+
 # Arrow for binary columnar format
 arrow = "53"
 arrow-ipc = "53"
