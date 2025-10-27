@@ -1,7 +1,0 @@
-mo_share_call: 0.7
-mo_share_sms: 0.3
-workers: 4
-rotate_bytes: 100000000
-tz_name: "Europe/Moscow"
-subscriber_db_redb_path: "test_db_1m.redb"
-chunk_size: 100000
