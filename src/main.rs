@@ -1,6 +1,6 @@
 // Unified CDR generator (calls + SMS + data) for large-scale synthetic telecom datasets.
 //
-// Version 5.1 - Rust port with full behavioral compatibility.
+// Version 5.2 - Restructured with subcommands and redb-only subscriber database
 //
 // Features:
 // - One semicolon-delimited CSV for CALL/SMS/DATA with unified minimal spec
@@ -10,152 +10,310 @@
 // - Parallel processing with rayon
 // - Persistent cells catalog reused across runs
 // - Stable subscriber identity: MSISDN ↔ IMSI ↔ MCCMNC
+// - redb-based subscriber database for efficient chunked processing
 
 use chrono::{Datelike, Duration, TimeZone};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossbeam_channel::unbounded;
 use rayon::prelude::*;
 use rs_cdr_generator::async_writer::{writer_task, WriterMessage};
 use rs_cdr_generator::cells::{ensure_cells_catalog, load_cells_catalog};
 use rs_cdr_generator::config::{load_config, parse_prefixes, Config};
 use rs_cdr_generator::generators::worker_generate;
-use rs_cdr_generator::subscriber_db::SubscriberDatabase;
-use rs_cdr_generator::subscriber_db_generator::{generate_database_parallel_arrow, GeneratorConfig};
-use rs_cdr_generator::subscriber_db_redb::convert_arrow_to_redb;
+use rs_cdr_generator::subscriber_db_generator::{generate_database_redb, GeneratorConfig};
+use rs_cdr_generator::subscriber_db_redb::SubscriberDbRedb;
 use rs_cdr_generator::timezone_utils::tz_from_name;
 use rs_cdr_generator::utils::{bundle_day, create_daily_summary};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "rs_cdr_generator")]
 #[command(about = "Unified CDR generator (CALL/SMS/DATA)", long_about = None)]
-struct Args {
-    /// Количество абонентов
-    #[arg(long, default_value = "100000")]
-    subs: usize,
+#[command(version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    /// Стартовая дата YYYY-MM-DD
-    #[arg(long, default_value = "2025-01-01")]
-    start: String,
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Generate subscriber database in redb format
+    GenerateSubscribers {
+        /// Путь к выходному файлу базы данных (.redb)
+        #[arg(short, long, default_value = "subscriber_db.redb")]
+        output: PathBuf,
 
-    /// Сколько дней генерировать
-    #[arg(long, default_value = "1")]
-    days: usize,
+        /// Количество начальных абонентов
+        #[arg(long, default_value = "100000")]
+        size: usize,
 
-    /// Каталог вывода
-    #[arg(long, default_value = "out")]
-    out: PathBuf,
+        /// Период истории базы абонентов (дни)
+        #[arg(long, default_value = "365")]
+        history_days: usize,
 
-    /// Seed для детерминизма
-    #[arg(long, default_value = "42")]
-    seed: u64,
+        /// Вероятность смены устройства в год [0..1]
+        #[arg(long, default_value = "0.15")]
+        device_change_rate: f64,
 
-    /// Префиксы без кода страны, через запятую
-    #[arg(long)]
-    prefixes: Option<String>,
+        /// Вероятность освобождения номера в год [0..1]
+        #[arg(long, default_value = "0.05")]
+        number_release_rate: f64,
 
-    /// Предел размера файла (байт)
-    #[arg(long)]
-    rotate_bytes: Option<u64>,
+        /// Дни "остывания" номера перед переназначением
+        #[arg(long, default_value = "90")]
+        cooldown_days: usize,
 
-    /// Число процессов (0 = auto-detect)
-    #[arg(long)]
-    workers: Option<usize>,
+        /// Префиксы без кода страны, через запятую
+        #[arg(long)]
+        prefixes: Option<String>,
 
-    /// YAML конфиг поверх дефолтов
-    #[arg(long)]
-    config: Option<PathBuf>,
+        /// Seed для детерминизма
+        #[arg(long, default_value = "42")]
+        seed: u64,
 
-    /// Таймзона для локального времени
-    #[arg(long)]
-    tz: Option<String>,
+        /// YAML конфиг (для prefixes и mccmnc_pool)
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 
-    /// Сколько сгенерировать вышек (cell_id)
-    #[arg(long)]
-    cells: Option<usize>,
+    /// Generate CDR data from subscriber database
+    GenerateCdr {
+        /// Путь к базе данных подписчиков (redb)
+        #[arg(long)]
+        subscriber_db: PathBuf,
 
-    /// Центр (lat,lon) для генерации вышек
-    #[arg(long)]
-    cell_center: Option<String>,
+        /// Стартовая дата YYYY-MM-DD
+        #[arg(long, default_value = "2025-01-01")]
+        start: String,
 
-    /// Радиус круга (км) для вышек
-    #[arg(long)]
-    cell_radius_km: Option<f64>,
+        /// Сколько дней генерировать
+        #[arg(long, default_value = "1")]
+        days: usize,
 
-    /// Вероятность MO для CALL [0..1]
-    #[arg(long)]
-    mo_share_call: Option<f64>,
+        /// Каталог вывода
+        #[arg(long, default_value = "out")]
+        out: PathBuf,
 
-    /// Вероятность MO для SMS [0..1]
-    #[arg(long)]
-    mo_share_sms: Option<f64>,
+        /// Seed для детерминизма
+        #[arg(long, default_value = "42")]
+        seed: u64,
 
-    /// Вероятность смены IMEI в день [0..1]
-    #[arg(long)]
-    imei_change_prob: Option<f64>,
+        /// Префиксы без кода страны, через запятую
+        #[arg(long)]
+        prefixes: Option<String>,
 
-    /// Удалять исходные файлы после архивации
-    #[arg(long, default_value = "false")]
-    cleanup_after_archive: bool,
+        /// Предел размера файла (байт)
+        #[arg(long)]
+        rotate_bytes: Option<u64>,
 
-    // Subscriber database options
-    /// Путь к CSV файлу с базой абонентов
-    #[arg(long)]
-    subscriber_db: Option<PathBuf>,
+        /// Число процессов (0 = auto-detect)
+        #[arg(long)]
+        workers: Option<usize>,
 
-    /// Генерировать базу абонентов и сохранить в файл
-    #[arg(long)]
-    generate_db: Option<PathBuf>,
+        /// YAML конфиг поверх дефолтов
+        #[arg(long)]
+        config: Option<PathBuf>,
 
-    /// Размер генерируемой базы абонентов
-    #[arg(long)]
-    db_size: Option<usize>,
+        /// Таймзона для локального времени
+        #[arg(long)]
+        tz: Option<String>,
 
-    /// Период истории базы абонентов (дни)
-    #[arg(long)]
-    db_history_days: Option<usize>,
+        /// Сколько сгенерировать вышек (cell_id)
+        #[arg(long)]
+        cells: Option<usize>,
 
-    /// Вероятность смены устройства в год [0..1]
-    #[arg(long)]
-    db_device_change_rate: Option<f64>,
+        /// Центр (lat,lon) для генерации вышек
+        #[arg(long)]
+        cell_center: Option<String>,
 
-    /// Вероятность освобождения номера в год [0..1]
-    #[arg(long)]
-    db_number_release_rate: Option<f64>,
+        /// Радиус круга (км) для вышек
+        #[arg(long)]
+        cell_radius_km: Option<f64>,
 
-    /// Дни "остывания" номера перед переназначением
-    #[arg(long)]
-    db_cooldown_days: Option<usize>,
+        /// Вероятность MO для CALL [0..1]
+        #[arg(long)]
+        mo_share_call: Option<f64>,
 
-    /// Только валидировать базу абонентов (не генерировать CDR)
-    #[arg(long, default_value = "false")]
-    validate_db: bool,
+        /// Вероятность MO для SMS [0..1]
+        #[arg(long)]
+        mo_share_sms: Option<f64>,
 
-    /// Конвертировать Arrow базу абонентов в redb формат (формат: arrow_path:redb_path)
-    #[arg(long)]
-    convert_to_redb: Option<String>,
+        /// Вероятность смены IMEI в день [0..1]
+        #[arg(long)]
+        imei_change_prob: Option<f64>,
+
+        /// Удалять исходные файлы после архивации
+        #[arg(long, default_value = "false")]
+        cleanup_after_archive: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    // Load and merge configuration with CLI priority
-    let mut cfg = if let Some(config_path) = &args.config {
-        load_config(Some(config_path))?
+    match cli.command {
+        Commands::GenerateSubscribers {
+            output,
+            size,
+            history_days,
+            device_change_rate,
+            number_release_rate,
+            cooldown_days,
+            prefixes,
+            seed,
+            config,
+        } => {
+            handle_generate_subscribers(
+                output,
+                size,
+                history_days,
+                device_change_rate,
+                number_release_rate,
+                cooldown_days,
+                prefixes,
+                seed,
+                config,
+            )
+        }
+        Commands::GenerateCdr {
+            subscriber_db,
+            start,
+            days,
+            out,
+            seed,
+            prefixes,
+            rotate_bytes,
+            workers,
+            config,
+            tz,
+            cells,
+            cell_center,
+            cell_radius_km,
+            mo_share_call,
+            mo_share_sms,
+            imei_change_prob,
+            cleanup_after_archive,
+        } => {
+            handle_generate_cdr(
+                subscriber_db,
+                start,
+                days,
+                out,
+                seed,
+                prefixes,
+                rotate_bytes,
+                workers,
+                config,
+                tz,
+                cells,
+                cell_center,
+                cell_radius_km,
+                mo_share_call,
+                mo_share_sms,
+                imei_change_prob,
+                cleanup_after_archive,
+            )
+        }
+    }
+}
+
+fn handle_generate_subscribers(
+    output: PathBuf,
+    size: usize,
+    history_days: usize,
+    device_change_rate: f64,
+    number_release_rate: f64,
+    cooldown_days: usize,
+    prefixes: Option<String>,
+    seed: u64,
+    config_path: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    println!("=== Generating Subscriber Database ===\n");
+
+    // Load config for prefixes and mccmnc_pool
+    let cfg = if let Some(ref path) = config_path {
+        load_config(Some(path))?
     } else {
         Config::default()
     };
 
-    // CLI overrides YAML (only if explicitly provided)
-    if let Some(prefixes_str) = &args.prefixes {
-        cfg.prefixes = parse_prefixes(prefixes_str)?;
+    // Parse prefixes from CLI or use config
+    let prefixes_list = if let Some(prefixes_str) = prefixes {
+        parse_prefixes(&prefixes_str)?
+    } else {
+        cfg.prefixes.clone()
+    };
+
+    let gen_config = GeneratorConfig {
+        initial_subscribers: size,
+        history_days,
+        device_change_rate: device_change_rate.max(0.0).min(1.0),
+        number_release_rate: number_release_rate.max(0.0).min(1.0),
+        cooldown_days,
+        prefixes: prefixes_list,
+        mccmnc_pool: cfg.mccmnc_pool.clone(),
+        seed,
+        start_timestamp_ms: 1704067200000, // 2024-01-01
+    };
+
+    generate_database_redb(&gen_config, &output)?;
+
+    println!("\n=== Subscriber Database Generation Complete ===");
+    println!("Database file: {:?}", output);
+
+    Ok(())
+}
+
+fn handle_generate_cdr(
+    subscriber_db: PathBuf,
+    start: String,
+    days: usize,
+    out: PathBuf,
+    seed: u64,
+    prefixes: Option<String>,
+    rotate_bytes: Option<u64>,
+    workers: Option<usize>,
+    config_path: Option<PathBuf>,
+    tz: Option<String>,
+    cells: Option<usize>,
+    cell_center: Option<String>,
+    cell_radius_km: Option<f64>,
+    mo_share_call: Option<f64>,
+    mo_share_sms: Option<f64>,
+    imei_change_prob: Option<f64>,
+    cleanup_after_archive: bool,
+) -> anyhow::Result<()> {
+    println!("=== Generating CDR Data ===\n");
+
+    // Verify subscriber database exists
+    if !subscriber_db.exists() {
+        eprintln!("Error: Subscriber database not found: {:?}", subscriber_db);
+        eprintln!("\nPlease generate a subscriber database first:");
+        eprintln!("  rs_cdr_generator generate-subscribers --output subscriber_db.redb");
+        std::process::exit(1);
     }
 
-    if let Some(rb) = args.rotate_bytes {
+    // Load and merge configuration with CLI priority
+    let mut cfg = if let Some(ref path) = config_path {
+        load_config(Some(path))?
+    } else {
+        Config::default()
+    };
+
+    // Set subscriber database path
+    cfg.subscriber_db_redb_path = Some(subscriber_db.clone());
+
+    // CLI overrides YAML (only if explicitly provided)
+    if let Some(prefixes_str) = prefixes {
+        cfg.prefixes = parse_prefixes(&prefixes_str)?;
+    }
+
+    if let Some(rb) = rotate_bytes {
         cfg.rotate_bytes = rb;
     }
 
-    if let Some(w) = args.workers {
+    if let Some(w) = workers {
         cfg.workers = if w == 0 {
             num_cpus::get()
         } else {
@@ -165,131 +323,24 @@ fn main() -> anyhow::Result<()> {
         cfg.workers = num_cpus::get();
     }
 
-    if let Some(tz) = &args.tz {
-        cfg.tz_name = tz.clone();
+    if let Some(tz_name) = tz {
+        cfg.tz_name = tz_name;
     }
 
-    if let Some(mo) = args.mo_share_call {
+    if let Some(mo) = mo_share_call {
         cfg.mo_share_call = mo.max(0.0).min(1.0);
     }
 
-    if let Some(mo) = args.mo_share_sms {
+    if let Some(mo) = mo_share_sms {
         cfg.mo_share_sms = mo.max(0.0).min(1.0);
     }
 
-    if let Some(prob) = args.imei_change_prob {
+    if let Some(prob) = imei_change_prob {
         cfg.imei_daily_change_prob = prob.max(0.0).min(1.0);
     }
 
-    // Subscriber database options
-    cfg.subscriber_db_path = args.subscriber_db.clone();
-    cfg.generate_subscriber_db = args.generate_db.clone();
-    cfg.validate_db_only = args.validate_db;
-
-    // Handle Arrow to redb conversion if requested
-    if let Some(ref convert_spec) = args.convert_to_redb {
-        let parts: Vec<&str> = convert_spec.split(':').collect();
-        if parts.len() != 2 {
-            eprintln!("Error: --convert-to-redb format must be: arrow_path:redb_path");
-            eprintln!("Example: --convert-to-redb test_db_1m.arrow:test_db_1m.redb");
-            std::process::exit(1);
-        }
-
-        let arrow_path = PathBuf::from(parts[0]);
-        let redb_path = PathBuf::from(parts[1]);
-
-        println!("Converting Arrow database to redb...");
-        println!("  Source: {:?}", arrow_path);
-        println!("  Target: {:?}", redb_path);
-
-        // Use start and end timestamps from config or defaults
-        let start_ts = 0i64;  // Start from beginning
-        let end_ts = 1735689600000i64;  // 2025-01-01 (far future to include all data)
-
-        convert_arrow_to_redb(&arrow_path, &redb_path, start_ts, end_ts)?;
-
-        println!("\nConversion complete!");
-        println!("You can now use --subscriber-db-redb-path {:?} in your config", redb_path);
-        return Ok(());
-    }
-
-    if let Some(size) = args.db_size {
-        cfg.db_size = size;
-    }
-    if let Some(days) = args.db_history_days {
-        cfg.db_history_days = days;
-    }
-    if let Some(rate) = args.db_device_change_rate {
-        cfg.db_device_change_rate = rate.max(0.0).min(1.0);
-    }
-    if let Some(rate) = args.db_number_release_rate {
-        cfg.db_number_release_rate = rate.max(0.0).min(1.0);
-    }
-    if let Some(cooldown) = args.db_cooldown_days {
-        cfg.db_cooldown_days = cooldown;
-    }
-
-    // Handle subscriber database generation if requested
-    if let Some(ref gen_path) = cfg.generate_subscriber_db {
-        println!("Generating subscriber database...");
-
-        let gen_config = GeneratorConfig {
-            initial_subscribers: cfg.db_size,
-            history_days: cfg.db_history_days,
-            device_change_rate: cfg.db_device_change_rate,
-            number_release_rate: cfg.db_number_release_rate,
-            cooldown_days: cfg.db_cooldown_days,
-            prefixes: cfg.prefixes.clone(),
-            mccmnc_pool: cfg.mccmnc_pool.clone(),
-            seed: args.seed,
-            start_timestamp_ms: 1704067200000, // 2024-01-01
-        };
-
-        // Generate in Arrow format (auto-detect by extension)
-        generate_database_parallel_arrow(&gen_config, gen_path)?;
-
-        println!("Subscriber database generated successfully!");
-
-        // If only generation was requested (no CDR generation), exit
-        if cfg.subscriber_db_path.is_none() && !cfg.validate_db_only {
-            return Ok(());
-        }
-    }
-
-    // Handle subscriber database validation if requested
-    if cfg.validate_db_only {
-        if let Some(ref db_path) = cfg.subscriber_db_path {
-            println!("Loading subscriber database from {:?}...", db_path);
-
-            // Auto-detect format
-            let db = if db_path.extension().and_then(|s| s.to_str()) == Some("arrow") {
-                SubscriberDatabase::load_from_arrow(db_path)?
-            } else {
-                SubscriberDatabase::load_from_csv(db_path)?
-            };
-
-            println!("Validating database...");
-            db.validate()?;
-
-            println!("✓ Database validation passed!");
-            println!("  Events: {}", db.event_count());
-            println!("  Unique IMSI: {}", db.unique_imsi_count());
-
-            return Ok(());
-        } else {
-            eprintln!("Error: --validate-db requires --subscriber-db <path>");
-            std::process::exit(1);
-        }
-    }
-
-    // Subscriber database path (workers will load and filter their own range)
-    if let Some(ref db_path) = cfg.subscriber_db_path {
-        println!("Using subscriber database: {:?}", db_path);
-        println!("Note: Each worker will load and filter only its subscriber range");
-    }
-
     // Parse cell center from CLI or use config values
-    let (center_lat, center_lon) = if let Some(ref cell_center_str) = args.cell_center {
+    let (center_lat, center_lon) = if let Some(cell_center_str) = cell_center {
         let parts: Vec<&str> = cell_center_str.split(',').collect();
         if parts.len() == 2 {
             let lat = parts[0].trim().parse::<f64>().unwrap_or(cfg.center_lat);
@@ -302,17 +353,17 @@ fn main() -> anyhow::Result<()> {
         (cfg.center_lat, cfg.center_lon)
     };
 
-    let cell_radius = args.cell_radius_km.unwrap_or(cfg.radius_km);
-    let num_cells = args.cells.unwrap_or(cfg.cells);
+    let cell_radius = cell_radius_km.unwrap_or(cfg.radius_km);
+    let num_cells = cells.unwrap_or(cfg.cells);
 
     // Ensure cells catalog
     let cells_path = ensure_cells_catalog(
-        &args.out,
+        &out,
         num_cells,
         center_lat,
         center_lon,
         cell_radius,
-        args.seed,
+        seed,
     )?;
 
     let (_cells_all, _cells_by_rat) = load_cells_catalog(&cells_path)?;
@@ -320,10 +371,18 @@ fn main() -> anyhow::Result<()> {
     let tz = tz_from_name(&cfg.tz_name);
 
     // Parse start date
-    let start_date = chrono::NaiveDate::parse_from_str(&args.start, "%Y-%m-%d")?;
+    let start_date = chrono::NaiveDate::parse_from_str(&start, "%Y-%m-%d")?;
+
+    // Open redb database (will be shared across all workers)
+    println!("Loading subscriber database: {:?}", subscriber_db);
+    let redb = SubscriberDbRedb::open(&subscriber_db)?;
+    let subs = redb.count_msisdns()?;
+    println!("Loaded {} subscribers from database\n", subs);
+
+    let redb_arc = Arc::new(redb);
 
     // Generate data for each day
-    for d in 0..args.days {
+    for d in 0..days {
         let day_naive = start_date + Duration::days(d as i64);
         let day = tz
             .with_ymd_and_hms(
@@ -337,32 +396,11 @@ fn main() -> anyhow::Result<()> {
             .unwrap();
 
         let day_str = day.format("%Y-%m-%d").to_string();
-        let day_dir = args.out.join(&day_str);
+        let day_dir = out.join(&day_str);
         std::fs::create_dir_all(&day_dir)?;
 
         // Split users uniformly across workers
         let w = cfg.workers;
-
-        // Open redb database if configured (will be shared across all workers)
-        let redb_arc = if let Some(ref redb_path) = cfg.subscriber_db_redb_path {
-            use rs_cdr_generator::subscriber_db_redb::SubscriberDbRedb;
-            use std::sync::Arc;
-            let redb = SubscriberDbRedb::open(redb_path)?;
-            Some(Arc::new(redb))
-        } else {
-            None
-        };
-
-        // Determine number of subscribers
-        let subs = if let Some(ref redb) = redb_arc {
-            let count = redb.count_msisdns()?;
-            println!("Auto-detected {} subscribers from redb database", count);
-            count
-        } else {
-            // Use command-line argument
-            args.subs
-        };
-
         let shard_size = subs / w;
 
         let mut ranges = Vec::new();
@@ -391,7 +429,7 @@ fn main() -> anyhow::Result<()> {
             let (tx, rx) = unbounded();
             writer_channels.push(tx);
 
-            let out_dir = args.out.clone();
+            let out_dir = out.clone();
             let day_str_clone = day_str.clone();
             let rotate_bytes = cfg.rotate_bytes;
             let compression_type = rs_cdr_generator::compression::CompressionType::from_str(&cfg.compression_type)
@@ -413,7 +451,6 @@ fn main() -> anyhow::Result<()> {
         }
 
         // Run workers in parallel with writer channels
-        let sub_db_path = cfg.subscriber_db_path.as_deref();
         ranges
             .par_iter()
             .enumerate()
@@ -422,7 +459,7 @@ fn main() -> anyhow::Result<()> {
                 let writer_idx = i % writer_tasks;
                 let writer_tx = writer_channels[writer_idx].clone();
 
-                worker_generate(day, i, (lo, hi), &cfg, &args.out, sub_db_path, redb_arc.as_ref(), writer_tx)
+                worker_generate(day, i, (lo, hi), &cfg, &out, None, Some(&redb_arc), writer_tx)
             })?;
 
         // Send Close messages to all writers
@@ -436,14 +473,16 @@ fn main() -> anyhow::Result<()> {
         }
 
         // Create summary and bundle
-        create_daily_summary(&args.out, &day)?;
+        create_daily_summary(&out, &day)?;
         let compression_ext = rs_cdr_generator::compression::CompressionType::from_str(&cfg.compression_type)
             .unwrap_or(rs_cdr_generator::compression::CompressionType::Gzip)
             .extension();
-        let tarfile_path = bundle_day(&args.out, &day, args.cleanup_after_archive, compression_ext)?;
+        let tarfile_path = bundle_day(&out, &day, cleanup_after_archive, compression_ext)?;
 
         println!("Day {} done → {:?}", day_str, tarfile_path);
     }
+
+    println!("\n=== CDR Generation Complete ===");
 
     Ok(())
 }

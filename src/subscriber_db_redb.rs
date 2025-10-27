@@ -4,7 +4,7 @@ use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::subscriber_db::{SubscriberDatabase, SubscriberSnapshot};
+use crate::subscriber_db::SubscriberSnapshot;
 
 /// Numeric version of SubscriberSnapshot for efficient storage and lookup
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,84 +210,6 @@ impl SubscriberDbRedb {
 pub struct DbStats {
     pub total_msisdns: u64,
     pub total_snapshots: u64,
-}
-
-/// Convert Arrow subscriber database to redb format
-/// This reads the Arrow database, builds snapshots, and stores them in redb
-/// grouped by MSISDN for efficient chunk loading
-pub fn convert_arrow_to_redb(
-    arrow_path: &Path,
-    redb_path: &Path,
-    start_ts: i64,
-    end_ts: i64,
-) -> Result<()> {
-    use std::collections::HashMap;
-
-    println!("Converting Arrow database to redb...");
-    println!("  Source: {:?}", arrow_path);
-    println!("  Target: {:?}", redb_path);
-
-    // Load Arrow database and build snapshots
-    println!("Loading Arrow database...");
-    let mut db = SubscriberDatabase::load_from_arrow_range(arrow_path, start_ts, end_ts)?;
-
-    println!("Building snapshots...");
-    db.build_snapshots();
-
-    let snapshots = db.get_snapshots();
-    println!("Total snapshots: {}", snapshots.len());
-
-    // Group snapshots by MSISDN
-    println!("Grouping snapshots by MSISDN...");
-    let mut msisdn_snapshots: HashMap<u64, Vec<SubscriberSnapshotNumeric>> = HashMap::new();
-
-    for snapshot in snapshots {
-        let msisdn = snapshot.msisdn.parse::<u64>().unwrap_or(0);
-        if msisdn == 0 {
-            continue; // Skip invalid MSISDNs
-        }
-
-        let numeric_snapshot = SubscriberSnapshotNumeric::from(snapshot);
-        msisdn_snapshots.entry(msisdn)
-            .or_insert_with(Vec::new)
-            .push(numeric_snapshot);
-    }
-
-    println!("Unique MSISDNs: {}", msisdn_snapshots.len());
-
-    // Create redb database and insert snapshots
-    println!("Creating redb database...");
-    let redb = SubscriberDbRedb::new(redb_path)?;
-
-    println!("Inserting snapshots into redb (batch mode)...");
-
-    // Convert HashMap to Vec for batching
-    let all_entries: Vec<(u64, Vec<SubscriberSnapshotNumeric>)> = msisdn_snapshots.into_iter().collect();
-    let total = all_entries.len();
-
-    // Insert in batches of 10,000 for optimal performance
-    let batch_size = 10_000;
-    let mut inserted = 0;
-
-    for batch_start in (0..total).step_by(batch_size) {
-        let batch_end = (batch_start + batch_size).min(total);
-        let batch = &all_entries[batch_start..batch_end];
-
-        redb.insert_snapshots_batch(batch)?;
-        inserted += batch.len();
-
-        println!("  Inserted {}/{} MSISDNs...", inserted, total);
-    }
-
-    println!("Conversion complete! Inserted {} MSISDNs", inserted);
-
-    // Print statistics
-    let stats = redb.stats()?;
-    println!("Database statistics:");
-    println!("  Total MSISDNs: {}", stats.total_msisdns);
-    println!("  Total snapshots: {}", stats.total_snapshots);
-
-    Ok(())
 }
 
 #[cfg(test)]

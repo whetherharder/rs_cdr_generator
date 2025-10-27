@@ -498,28 +498,13 @@ pub fn worker_generate(
     let seed = (cfg.workers as u64).wrapping_mul(1000) + shard_id as u64;
     let mut rng = StdRng::seed_from_u64(seed);
 
-    // Load and filter subscriber database for this worker's subscriber range
+    // Load and filter subscriber database for this worker's subscriber range (CSV format only)
     let subscriber_db = if let Some(db_path) = subscriber_db_path {
         let (start_u, end_u) = users_range;
 
-        // Load events from start of history to end of generation day
-        let day_end_ts = (day + Duration::days(1)).timestamp_millis();
-
-        // Memory-efficient loading: filter during read, not after
-        let mut filtered_db = if db_path.extension().and_then(|s| s.to_str()) == Some("arrow") {
-            SubscriberDatabase::load_from_arrow_with_msisdn_filter(
-                db_path,
-                0,
-                day_end_ts,
-                start_u,
-                end_u,
-                &cfg.prefixes,
-            )?
-        } else {
-            // CSV fallback: still need to load all then filter
-            let full_db = SubscriberDatabase::load_from_csv(db_path)?;
-            full_db.filter_by_msisdn_range(start_u, end_u, &cfg.prefixes)
-        };
+        // CSV loading: load all then filter
+        let full_db = SubscriberDatabase::load_from_csv(db_path)?;
+        let mut filtered_db = full_db.filter_by_msisdn_range(start_u, end_u, &cfg.prefixes);
 
         // Build snapshots for fast lookup
         filtered_db.build_snapshots();

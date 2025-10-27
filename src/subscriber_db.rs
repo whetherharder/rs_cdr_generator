@@ -69,7 +69,7 @@ pub struct SubscriberSnapshot {
 /// Main subscriber database with history
 #[derive(Debug)]
 pub struct SubscriberDatabase {
-    events: Vec<SubscriberEvent>,
+    pub events: Vec<SubscriberEvent>,
     // Indices for fast lookup
     by_imsi: HashMap<String, Vec<usize>>,      // IMSI -> event indices
     by_msisdn: HashMap<String, Vec<usize>>,    // MSISDN -> event indices
@@ -155,7 +155,7 @@ impl SubscriberDatabase {
     }
 
     /// Build indices for fast lookup
-    fn build_indices(&mut self) {
+    pub fn build_indices(&mut self) {
         self.by_imsi.clear();
         self.by_msisdn.clear();
 
@@ -491,63 +491,6 @@ impl SubscriberDatabase {
     /// Get all snapshots (requires build_snapshots() to be called first)
     pub fn get_snapshots(&self) -> &[SubscriberSnapshot] {
         &self.snapshots
-    }
-
-    /// Load subscriber database from Arrow IPC file
-    pub fn load_from_arrow<P: AsRef<Path>>(path: P) -> Result<Self> {
-        use crate::subscriber_db_arrow::read_events_from_arrow;
-
-        let events = read_events_from_arrow(path)?;
-        let mut db = SubscriberDatabase::new();
-        db.events = events;
-        db.build_indices();
-        Ok(db)
-    }
-
-    /// Load subscriber database from Arrow IPC file with timestamp range filter
-    pub fn load_from_arrow_range<P: AsRef<Path>>(
-        path: P,
-        start_ts: i64,
-        end_ts: i64,
-    ) -> Result<Self> {
-        use crate::subscriber_db_arrow::read_events_from_arrow_range;
-
-        let events = read_events_from_arrow_range(path, start_ts, end_ts)?;
-        let mut db = SubscriberDatabase::new();
-        db.events = events;
-        db.build_indices();
-        Ok(db)
-    }
-
-    /// Load from Arrow with filtering during read (memory-efficient)
-    /// Reads batches and filters on-the-fly, avoiding loading entire file into memory
-    pub fn load_from_arrow_with_msisdn_filter<P: AsRef<Path>>(
-        path: P,
-        start_ts: i64,
-        end_ts: i64,
-        start_u: usize,
-        end_u: usize,
-        prefixes: &[String],
-    ) -> Result<Self> {
-        use crate::subscriber_db_arrow::read_events_from_arrow_filtered;
-        use std::collections::HashSet;
-
-        // Generate MSISDN set for this worker's range
-        let msisdn_set: HashSet<String> = (start_u..end_u)
-            .map(|idx| {
-                let prefix = &prefixes[idx % prefixes.len()];
-                let number = idx % 10_000_000;
-                format!("{}{:07}", prefix, number)
-            })
-            .collect();
-
-        // Read with filtering during read (batch-by-batch)
-        let events = read_events_from_arrow_filtered(path, start_ts, end_ts, &msisdn_set)?;
-
-        let mut db = SubscriberDatabase::new();
-        db.events = events;
-        db.build_indices();
-        Ok(db)
     }
 
     /// Filter database by MSISDN range (for worker partitioning)

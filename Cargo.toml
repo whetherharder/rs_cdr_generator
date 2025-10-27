@@ -29,10 +29,6 @@ csv = "1.3"
 itoa = "1.0"
 ryu = "1.0"
 
-# Arrow for binary columnar format
-arrow = "53"
-arrow-ipc = "53"
-
 # Embedded key-value database for subscriber snapshots
 redb = "2.4"
 
@@ -90,8 +86,3 @@ debug = true
 inherits = "release"
 debug = true
 strip = false
-
-# Benchmark configurations
-[[bench]]
-name = "cdr_benchmark"
-harness = false
