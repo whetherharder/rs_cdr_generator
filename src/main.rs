@@ -393,6 +393,7 @@ fn main() -> anyhow::Result<()> {
 
             let out_dir = args.out.clone();
             let day_str_clone = day_str.clone();
+            let rotate_bytes = cfg.rotate_bytes;
 
             let handle = rt.spawn(async move {
                 writer_task(
@@ -400,6 +401,7 @@ fn main() -> anyhow::Result<()> {
                     out_dir,
                     day_str_clone,
                     shard_id,
+                    rotate_bytes,
                 )
                 .await
             });

@@ -1,13 +1,8 @@
 // Async batched writer for CDR events using Tokio
-use crate::writer::EventRow;
+use crate::writer::{EventRow, EventWriter};
 use anyhow::Result;
 use crossbeam_channel::Receiver;
-use csv::WriterBuilder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
-use std::fs::File;
-use std::io::BufWriter;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Batch of EventRow objects ready to be written
 pub struct EventBatch {
@@ -53,20 +48,35 @@ pub enum WriterMessage {
 }
 
 /// Async writer task that processes batches of events
+/// OPTIMIZATION #5: Reuse EventWriter across batches instead of creating new files
 pub async fn writer_task(
     rx: Receiver<WriterMessage>,
     out_dir: PathBuf,
     day_str: String,
     shard_id: usize,
+    rotate_bytes: u64,
 ) -> Result<()> {
-    // Create output directory
-    let day_dir = out_dir.join(&day_str);
-    tokio::fs::create_dir_all(&day_dir).await?;
+    // Run in spawn_blocking since we're doing sync I/O with persistent writer
+    tokio::task::spawn_blocking(move || {
+        writer_task_blocking(rx, out_dir, day_str, shard_id, rotate_bytes)
+    })
+    .await?
+}
 
-    let mut part_num = 1;
+/// Blocking writer task that reuses EventWriter for all batches (OPTIMIZATION #5)
+fn writer_task_blocking(
+    rx: Receiver<WriterMessage>,
+    out_dir: PathBuf,
+    day_str: String,
+    shard_id: usize,
+    rotate_bytes: u64,
+) -> Result<()> {
+    // Create EventWriter once and reuse it for all batches (OPTIMIZATION #5)
+    let mut writer = EventWriter::new(&out_dir, &day_str, rotate_bytes, shard_id)?;
+
     let mut total_written = 0usize;
 
-    // Use crossbeam_channel recv() in async context
+    // Process batches from channel
     loop {
         let msg = match rx.recv() {
             Ok(msg) => msg,
@@ -79,31 +89,21 @@ pub async fn writer_task(
                     continue;
                 }
 
-                let batch_len = batch.len();
+                // Write all events in batch using persistent writer (OPTIMIZATION #5)
+                for event in &batch.events {
+                    writer.write_row(event)?;
+                }
 
-                // Write batch to file (blocking I/O in spawn_blocking)
-                let day_dir_clone = day_dir.clone();
-                let day_str_clone = day_str.clone();
-
-                tokio::task::spawn_blocking(move || {
-                    write_batch_to_file(
-                        &batch,
-                        &day_dir_clone,
-                        &day_str_clone,
-                        shard_id,
-                        part_num,
-                    )
-                })
-                .await??;
-
-                total_written += batch_len;
-                part_num += 1;
+                total_written += batch.len();
             }
             WriterMessage::Close => {
                 break;
             }
         }
     }
+
+    // Close writer (flushes and finishes compression)
+    writer.close()?;
 
     println!(
         "Writer task for shard {} completed: {} events written",
@@ -113,38 +113,6 @@ pub async fn writer_task(
     Ok(())
 }
 
-/// Write a batch of events to a gzip-compressed CSV file
-fn write_batch_to_file(
-    batch: &EventBatch,
-    day_dir: &Path,
-    day_str: &str,
-    shard_id: usize,
-    part_num: usize,
-) -> Result<()> {
-    let filename = format!(
-        "cdr_{}_shard{:03}_part{:03}.csv.gz",
-        day_str, shard_id, part_num
-    );
-    let filepath = day_dir.join(&filename);
-
-    let file = File::create(&filepath)?;
-    let buffered = BufWriter::with_capacity(256 * 1024, file);
-    let compressed = GzEncoder::new(buffered, Compression::default());
-
-    let mut wtr = WriterBuilder::new()
-        .delimiter(b';')
-        .has_headers(true)
-        .from_writer(compressed);
-
-    for event in &batch.events {
-        wtr.serialize(event)?;
-    }
-
-    wtr.flush()?;
-    wtr.into_inner()?.finish()?;
-
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

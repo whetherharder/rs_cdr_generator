@@ -32,7 +32,50 @@ pub fn sample_call_duration(rng: &mut StdRng, mu: f64, sigma: f64) -> i64 {
     log_normal.sample(rng).max(1.0) as i64
 }
 
-/// Sample from Poisson distribution
+/// Optimized sampler for event counts (Poisson approximation) (OPTIMIZATION #4)
+pub struct EventCountSampler {
+    pub mean: f64,
+    pub normal_dist: Option<Normal<f64>>,  // For mean >= 30, use Normal approximation
+    pub exp_lambda: f64,  // For mean < 30, use exact Poisson
+}
+
+impl EventCountSampler {
+    pub fn new(mean: f64) -> Self {
+        if mean >= 30.0 {
+            EventCountSampler {
+                mean,
+                normal_dist: Some(Normal::new(mean, mean.sqrt()).unwrap()),
+                exp_lambda: 0.0,
+            }
+        } else {
+            EventCountSampler {
+                mean,
+                normal_dist: None,
+                exp_lambda: (-mean).exp(),
+            }
+        }
+    }
+
+    pub fn sample(&self, rng: &mut StdRng) -> usize {
+        if self.mean <= 0.0 {
+            return 0;
+        }
+        if let Some(ref normal) = self.normal_dist {
+            normal.sample(rng).max(0.0) as usize
+        } else {
+            // Exact Poisson for small mean
+            let mut k: usize = 0;
+            let mut p = 1.0;
+            while p > self.exp_lambda {
+                k += 1;
+                p *= rng.gen::<f64>();
+            }
+            k.saturating_sub(1)
+        }
+    }
+}
+
+/// Sample from Poisson distribution (legacy function, kept for compatibility)
 pub fn sample_poisson(mean: f64, rng: &mut StdRng) -> usize {
     if mean <= 0.0 {
         return 0;
@@ -74,6 +117,7 @@ pub struct CallGenerator {
     dispo_dist: WeightedIndex<f64>,
     mu: f64,
     sigma: f64,
+    duration_dist: LogNormal<f64>,  // Pre-computed distribution (OPTIMIZATION #4)
 }
 
 impl CallGenerator {
@@ -93,12 +137,16 @@ impl CallGenerator {
             cfg.call_duration_quantiles.p90 as f64,
         );
 
+        // Pre-compute LogNormal distribution (OPTIMIZATION #4)
+        let duration_dist = LogNormal::new(mu, sigma).unwrap();
+
         CallGenerator {
             p_mo,
             dispo_pop,
             dispo_dist,
             mu,
             sigma,
+            duration_dist,
         }
     }
 
@@ -129,7 +177,8 @@ impl CallGenerator {
         let (dur_sec, cause) = match dispo.as_str() {
             "ANSWERED" => {
                 let ring = rng.gen_range(2..=25);
-                let dur = sample_call_duration(rng, self.mu, self.sigma);
+                // Use pre-computed distribution (OPTIMIZATION #4)
+                let dur = self.duration_dist.sample(rng).max(1.0) as i64;
                 (ring + dur, "normalRelease")
             }
             "NO ANSWER" => {
@@ -193,7 +242,8 @@ impl CallGenerator {
         let (dur_sec, cause) = match dispo.as_str() {
             "ANSWERED" => {
                 let ring = rng.gen_range(2..=25);
-                let dur = sample_call_duration(rng, self.mu, self.sigma);
+                // Use pre-computed distribution (OPTIMIZATION #4)
+                let dur = self.duration_dist.sample(rng).max(1.0) as i64;
                 (ring + dur, "normalRelease")
             }
             "NO ANSWER" => {
@@ -532,6 +582,11 @@ pub fn worker_generate(
     let avg_sms = cfg.avg_sms_per_user;
     let avg_data = cfg.avg_data_sessions_per_user;
 
+    // Pre-compute event count samplers (OPTIMIZATION #4)
+    let calls_sampler = EventCountSampler::new(avg_calls);
+    let sms_sampler = EventCountSampler::new(avg_sms);
+    let data_sampler = EventCountSampler::new(avg_data);
+
     // Initialize generators
     let call_gen = CallGenerator::new(cfg);
     let sms_gen = SmsGenerator::new(cfg);
@@ -592,26 +647,21 @@ pub fn worker_generate(
 
         let c = &contacts[uidx % contacts.len()];
         let c_pool = &c.pool;
-        let c_probs = &c.probs;
 
-        // Pre-create contact distribution (CRITICAL OPTIMIZATION!)
-        let contact_dist = if !c_pool.is_empty() {
-            Some(WeightedIndex::new(c_probs).unwrap())
-        } else {
-            None
-        };
+        // Use pre-computed contact distribution (OPTIMIZATION #2)
+        let contact_dist = c.dist.as_ref();
 
-        // Sample event counts for this user
-        let n_calls = sample_poisson(avg_calls, &mut rng);
-        let n_sms = sample_poisson(avg_sms, &mut rng);
-        let n_data = sample_poisson(avg_data, &mut rng);
+        // Sample event counts for this user (OPTIMIZATION #4)
+        let n_calls = calls_sampler.sample(&mut rng);
+        let n_sms = sms_sampler.sample(&mut rng);
+        let n_data = data_sampler.sample(&mut rng);
 
         // Generate CALL events
         for _ in 0..n_calls {
             let start_local = sample_time(&mut rng);
 
             // Pick counterpart MSISDN (u64) and track if they're in our database
-            let (other_msisdn, other_sub_opt): (u64, Option<&Subscriber>) = if let Some(ref dist) = contact_dist {
+            let (other_msisdn, other_sub_opt): (u64, Option<&Subscriber>) = if let Some(dist) = contact_dist {
                 let other_idx = c_pool[dist.sample(&mut rng)] % subs.len();
                 let other_sub = &subs[other_idx];
                 (other_sub.msisdn, Some(other_sub))
@@ -696,7 +746,7 @@ pub fn worker_generate(
             }
 
             // Pick counterpart MSISDN (u64)
-            let other_msisdn: u64 = if let Some(ref dist) = contact_dist {
+            let other_msisdn: u64 = if let Some(dist) = contact_dist {
                 let other_idx = c_pool[dist.sample(&mut rng)] % subs.len();
                 subs[other_idx].msisdn
             } else {
@@ -818,6 +868,11 @@ fn worker_generate_redb_chunked(
     let avg_sms = cfg.avg_sms_per_user;
     let avg_data = cfg.avg_data_sessions_per_user;
 
+    // Pre-compute event count samplers (OPTIMIZATION #4)
+    let calls_sampler = EventCountSampler::new(avg_calls);
+    let sms_sampler = EventCountSampler::new(avg_sms);
+    let data_sampler = EventCountSampler::new(avg_data);
+
     // Helper: sample time during the day with diurnal pattern
     let sample_time = |rng: &mut StdRng| -> DateTime<chrono_tz::Tz> {
         for _ in 0..10 {
@@ -850,24 +905,50 @@ fn worker_generate_redb_chunked(
     for chunk_start_idx in (0..total_subs).step_by(chunk_size) {
         let chunk_end_idx = (chunk_start_idx + chunk_size).min(total_subs);
 
-        // Load chunk from redb
-        // For each subscriber in chunk, generate MSISDN and lookup in redb
+        // Calculate MSISDN range for this chunk
+        let chunk_start_sub = start_msisdn_idx + chunk_start_idx;
+        let chunk_end_sub = start_msisdn_idx + chunk_end_idx;
+
+        // Calculate min and max MSISDN for efficient range query
+        let mut min_msisdn = u64::MAX;
+        let mut max_msisdn = 0u64;
+
+        for sub_idx in chunk_start_sub..chunk_end_sub {
+            let prefix_idx = sub_idx % cfg.prefixes.len();
+            let prefix = numeric_prefixes[prefix_idx];
+            let number = (sub_idx % 10_000_000) as u64;
+            let msisdn = prefix * 10_000_000 + number;
+            min_msisdn = min_msisdn.min(msisdn);
+            max_msisdn = max_msisdn.max(msisdn);
+        }
+
+        // Load chunk from redb in one transaction (OPTIMIZATION #1)
+        let chunk_data = redb.load_chunk(min_msisdn, max_msisdn + 1)?;
+
+        // Build HashMap for O(1) lookup (OPTIMIZATION #1)
+        let snapshot_cache: HashMap<u64, Vec<crate::subscriber_db_redb::SubscriberSnapshotNumeric>> =
+            chunk_data.into_iter().collect();
+
+        // Build subscriber list for this chunk using cache
         let mut chunk_subs = Vec::with_capacity((chunk_end_idx - chunk_start_idx) as usize);
 
-        for sub_idx in (start_msisdn_idx + chunk_start_idx)..(start_msisdn_idx + chunk_end_idx) {
-            // Generate MSISDN for this subscriber
-            let prefix = &cfg.prefixes[sub_idx % cfg.prefixes.len()];
-            let number = sub_idx % 10_000_000;
-            let msisdn = format!("{}{:07}", prefix, number).parse::<u64>().unwrap_or(0);
+        for sub_idx in chunk_start_sub..chunk_end_sub {
+            // Generate MSISDN using arithmetic (OPTIMIZATION #3 - partial)
+            let prefix_idx = sub_idx % cfg.prefixes.len();
+            let prefix = numeric_prefixes[prefix_idx];
+            let number = (sub_idx % 10_000_000) as u64;
+            let msisdn = prefix * 10_000_000 + number;
 
-            // Look up subscriber in redb
-            if let Some(snapshot) = redb.get_subscriber_at(msisdn, day_start_ts)? {
-                chunk_subs.push(Subscriber {
-                    msisdn: snapshot.msisdn,
-                    imsi: snapshot.imsi,
-                    imei: snapshot.imei,
-                    mccmnc: snapshot.mccmnc,
-                });
+            // Look up subscriber in cache (OPTIMIZATION #1)
+            if let Some(snapshots) = snapshot_cache.get(&msisdn) {
+                if let Some(snapshot) = crate::subscriber_db_redb::SubscriberDbRedb::find_snapshot_at(snapshots, day_start_ts) {
+                    chunk_subs.push(Subscriber {
+                        msisdn: snapshot.msisdn,
+                        imsi: snapshot.imsi,
+                        imei: snapshot.imei,
+                        mccmnc: snapshot.mccmnc,
+                    });
+                }
             }
         }
 
@@ -877,22 +958,23 @@ fn worker_generate_redb_chunked(
                 continue;
             }
 
-            // Sample event counts for this user
-            let n_calls = sample_poisson(avg_calls, &mut rng);
-            let n_sms = sample_poisson(avg_sms, &mut rng);
-            let n_data = sample_poisson(avg_data, &mut rng);
+            // Sample event counts for this user (OPTIMIZATION #4)
+            let n_calls = calls_sampler.sample(&mut rng);
+            let n_sms = sms_sampler.sample(&mut rng);
+            let n_data = data_sampler.sample(&mut rng);
 
             // Generate CALL events
             for _ in 0..n_calls {
                 let start_local = sample_time(&mut rng);
 
-                // Generate random contact MSISDN (either from our database or external)
+                // Generate random contact MSISDN using arithmetic (OPTIMIZATION #3)
                 let other_msisdn: u64 = if rng.gen::<f64>() < 0.7 {
                     // Generate from our subscriber range (may or may not be in DB)
                     let random_idx = rng.gen_range(start_msisdn_idx..end_msisdn_idx);
-                    let prefix = &cfg.prefixes[random_idx % cfg.prefixes.len()];
-                    let number = random_idx % 10_000_000;
-                    format!("{}{:07}", prefix, number).parse().unwrap_or(0)
+                    let prefix_idx = random_idx % cfg.prefixes.len();
+                    let prefix = numeric_prefixes[prefix_idx];
+                    let number = (random_idx % 10_000_000) as u64;
+                    prefix * 10_000_000 + number
                 } else {
                     // Generate external number
                     let prefix_idx = rng.gen_range(0..numeric_prefixes.len());
@@ -925,7 +1007,15 @@ fn worker_generate_redb_chunked(
                 }
 
                 // Check if other party is in database for MT generation
-                if let Some(other_snapshot) = redb.get_subscriber_at(other_msisdn, day_start_ts)? {
+                // First check cache, fallback to DB for out-of-chunk MSISDNs (OPTIMIZATION #1)
+                let other_snapshot_opt = if let Some(snapshots) = snapshot_cache.get(&other_msisdn) {
+                    crate::subscriber_db_redb::SubscriberDbRedb::find_snapshot_at(snapshots, day_start_ts).cloned()
+                } else {
+                    // Fallback: MSISDN is outside current chunk, use DB lookup
+                    redb.get_subscriber_at(other_msisdn, day_start_ts)?
+                };
+
+                if let Some(ref other_snapshot) = other_snapshot_opt {
                     if other_snapshot.msisdn == 0 {
                         continue;
                     }
@@ -969,12 +1059,13 @@ fn worker_generate_redb_chunked(
             for _ in 0..n_sms {
                 let start_local = sample_time(&mut rng);
 
-                // Generate random contact MSISDN
+                // Generate random contact MSISDN using arithmetic (OPTIMIZATION #3)
                 let other_msisdn: u64 = if rng.gen::<f64>() < 0.7 {
                     let random_idx = rng.gen_range(start_msisdn_idx..end_msisdn_idx);
-                    let prefix = &cfg.prefixes[random_idx % cfg.prefixes.len()];
-                    let number = random_idx % 10_000_000;
-                    format!("{}{:07}", prefix, number).parse().unwrap_or(0)
+                    let prefix_idx = random_idx % cfg.prefixes.len();
+                    let prefix = numeric_prefixes[prefix_idx];
+                    let number = (random_idx % 10_000_000) as u64;
+                    prefix * 10_000_000 + number
                 } else {
                     let prefix_idx = rng.gen_range(0..numeric_prefixes.len());
                     let prefix = numeric_prefixes[prefix_idx];

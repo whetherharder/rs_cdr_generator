@@ -162,6 +162,26 @@ impl SubscriberDbRedb {
         Ok(table.len()? as usize)
     }
 
+    /// Find snapshot valid at a given timestamp from a pre-loaded list
+    /// This is much faster than get_subscriber_at() for repeated lookups
+    /// Returns None if no valid snapshot found at that timestamp
+    pub fn find_snapshot_at(
+        snapshots: &[SubscriberSnapshotNumeric],
+        timestamp: i64,
+    ) -> Option<&SubscriberSnapshotNumeric> {
+        // Linear search through snapshots (they're sorted by valid_from)
+        // For small lists (typically 1-3 snapshots per subscriber), linear is faster than binary
+        for snapshot in snapshots {
+            let valid_from = snapshot.valid_from;
+            let valid_to = snapshot.valid_to.unwrap_or(i64::MAX);
+
+            if timestamp >= valid_from && timestamp < valid_to {
+                return Some(snapshot);
+            }
+        }
+        None
+    }
+
     /// Get statistics about the database
     pub fn stats(&self) -> Result<DbStats> {
         let read_txn = self.db.begin_read()?;

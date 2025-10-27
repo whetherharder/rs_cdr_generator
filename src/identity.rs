@@ -1,6 +1,7 @@
 // Subscriber identity management: MSISDN, IMSI, IMEI, MCCMNC
 use rand::Rng;
 use rand::rngs::StdRng;
+use rand::distributions::WeightedIndex;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Subscriber {
@@ -13,7 +14,8 @@ pub struct Subscriber {
 #[derive(Debug, Clone)]
 pub struct Contacts {
     pub pool: Vec<usize>,  // Indices of contacts within the shard
-    pub probs: Vec<f64>,   // Zipf-like probabilities
+    pub probs: Vec<f64>,   // Zipf-like probabilities (kept for compatibility)
+    pub dist: Option<WeightedIndex<f64>>,  // Pre-computed distribution (OPTIMIZATION #2)
 }
 
 /// Generate a valid 15-digit IMEI with Luhn checksum
@@ -104,6 +106,7 @@ pub fn build_contacts(
             contacts_list.push(Contacts {
                 pool: Vec::new(),
                 probs: Vec::new(),
+                dist: None,
             });
             continue;
         }
@@ -120,7 +123,10 @@ pub fn build_contacts(
         let total: f64 = weights.iter().sum();
         let probs: Vec<f64> = weights.iter().map(|w| w / total).collect();
 
-        contacts_list.push(Contacts { pool, probs });
+        // Pre-compute WeightedIndex distribution (OPTIMIZATION #2)
+        let dist = Some(WeightedIndex::new(&probs).unwrap());
+
+        contacts_list.push(Contacts { pool, probs, dist });
     }
 
     contacts_list
