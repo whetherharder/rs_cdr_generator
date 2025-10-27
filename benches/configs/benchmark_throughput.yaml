@@ -1,0 +1,54 @@
+# Heavier configuration for stress-testing throughput benchmarks.
+# Keeps values deterministic while exercising larger object pools.
+
+subscribers: 200000
+cells: 4500
+
+prefixes:
+  - "7916"
+  - "7917"
+  - "7920"
+  - "7921"
+
+mccmnc_pool:
+  - "25001"
+  - "25002"
+  - "25099"
+
+avg_calls_per_user: 4.5
+avg_sms_per_user: 8.0
+avg_data_sessions_per_user: 14.0
+
+mo_share_call: 0.6
+mo_share_sms: 0.52
+
+call_dispositions:
+  ANSWERED: 0.8
+  NO ANSWER: 0.13
+  BUSY: 0.03
+  FAILED: 0.025
+  CONGESTION: 0.015
+
+call_duration_quantiles:
+  p50: 90
+  p90: 260
+  p99: 720
+
+interconnect_share: 0.22
+
+compression_type: zstd
+rotate_bytes: 64_000_000
+workers: 8
+
+event_pool_size: 16000
+batch_size_bytes: 16_777_216  # 16 MB
+writer_tasks: 4
+chunk_size: 50000
+
+tz_name: "Europe/Moscow"
+
+db_size: 50000
+db_history_days: 365
+db_device_change_rate: 0.12
+db_number_release_rate: 0.05
+db_cooldown_days: 60

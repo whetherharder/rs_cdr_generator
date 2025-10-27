@@ -8,10 +8,13 @@ use rand::rngs::StdRng;
 use chrono_tz::Tz;
 use chrono::TimeZone;
 use std::collections::HashMap;
+use std::path::Path;
 
 fn create_test_config() -> Config {
-    rs_cdr_generator::config::load_config(Some(std::path::Path::new("config.yaml")))
-        .expect("Failed to load config")
+    let config_path = std::env::var("BENCH_CONFIG")
+        .unwrap_or_else(|_| "benches/configs/benchmark_micro.yaml".to_string());
+    rs_cdr_generator::config::load_config(Some(Path::new(&config_path)))
+        .unwrap_or_else(|err| panic!("Failed to load config ({config_path}): {err}"))
 }
 
 fn create_test_subscriber() -> Subscriber {

@@ -1,0 +1,53 @@
+# Configuration for CPU profiling / flamegraphs.
+# Broad workload with deterministic seeds to aid comparison between runs.
+
+subscribers: 100000
+cells: 3000
+
+prefixes:
+  - "7916"
+  - "7917"
+  - "7920"
+
+mccmnc_pool:
+  - "25001"
+  - "25002"
+  - "25003"
+
+avg_calls_per_user: 3.8
+avg_sms_per_user: 6.5
+avg_data_sessions_per_user: 10.0
+
+mo_share_call: 0.58
+mo_share_sms: 0.51
+
+call_dispositions:
+  ANSWERED: 0.82
+  NO ANSWER: 0.12
+  BUSY: 0.03
+  FAILED: 0.02
+  CONGESTION: 0.01
+
+call_duration_quantiles:
+  p50: 80
+  p90: 240
+  p99: 600
+
+interconnect_share: 0.2
+
+compression_type: zstd
+rotate_bytes: 48_000_000
+workers: 4
+
+event_pool_size: 12000
+batch_size_bytes: 8_388_608  # 8 MB
+writer_tasks: 0
+chunk_size: 25000
+
+tz_name: "Europe/Moscow"
+
+db_size: 20000
+db_history_days: 180
+db_device_change_rate: 0.1
+db_number_release_rate: 0.04
+db_cooldown_days: 45

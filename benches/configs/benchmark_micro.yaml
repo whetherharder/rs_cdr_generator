@@ -1,0 +1,52 @@
+# Lightweight configuration tuned for running Criterion microbenchmarks quickly.
+# Values trade realism for predictable, low-latency runs.
+
+subscribers: 5000
+cells: 250
+
+prefixes:
+  - "7916"
+  - "7917"
+  - "7920"
+
+mccmnc_pool:
+  - "25001"
+  - "25002"
+
+avg_calls_per_user: 2.5
+avg_sms_per_user: 4.0
+avg_data_sessions_per_user: 6.0
+
+mo_share_call: 0.55
+mo_share_sms: 0.5
+
+call_dispositions:
+  ANSWERED: 0.85
+  NO ANSWER: 0.1
+  BUSY: 0.03
+  FAILED: 0.015
+  CONGESTION: 0.005
+
+call_duration_quantiles:
+  p50: 70
+  p90: 180
+  p99: 420
+
+interconnect_share: 0.18
+
+compression_type: zstd
+rotate_bytes: 32_000_000
+workers: 0
+
+event_pool_size: 4000
+batch_size_bytes: 1_048_576  # 1 MB
+writer_tasks: 0
+chunk_size: 5000
+
+tz_name: "Europe/Moscow"
+
+db_size: 5000
+db_history_days: 90
+db_device_change_rate: 0.05
+db_number_release_rate: 0.02
+db_cooldown_days: 30

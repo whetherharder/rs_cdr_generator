@@ -206,7 +206,18 @@ Look for:
 
 ## Configuration
 
-Benchmarks use `config.yaml` from project root. Ensure it exists before running benchmarks.
+Benchmarks load configuration from YAML files under `benches/configs/`.  
+By default we use `benchmark_micro.yaml`, which keeps runs fast and predictable.
+
+Available presets:
+- `benchmark_micro.yaml` – quick smoke runs for local Criterion iterations
+- `benchmark_profiling.yaml` – balanced workload for flamegraphs / CPU profiling
+- `benchmark_throughput.yaml` – larger stress scenario for throughput regressions
+
+Override the preset with the `BENCH_CONFIG` environment variable:
+```bash
+BENCH_CONFIG=benches/configs/benchmark_throughput.yaml cargo bench
+```
 
 Criterion configuration in `Cargo.toml`:
 ```toml

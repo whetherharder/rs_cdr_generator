@@ -104,7 +104,9 @@ See [benches/README.md](benches/README.md) for detailed benchmark documentation.
 
 ## Configuration
 
-Create a `config.yaml` file:
+### Runtime (CLI)
+
+Create a `config.yaml` file with your desired workload parameters:
 
 ```yaml
 prefixes:
@@ -112,14 +114,27 @@ prefixes:
   - "7917"
 
 mccmnc_pool:
-  - 25001
-  - 25002
+  - "25001"
+  - "25002"
 
 avg_calls_per_user: 5.0
 avg_sms_per_user: 10.0
 avg_data_sessions_per_user: 20.0
 
-compression: zstd  # gzip, zstd, or none
+compression_type: zstd  # gzip, zstd, or none
+```
+
+### Benchmark presets
+
+Ready-to-use YAML presets live in `benches/configs/`:
+- `benchmark_micro.yaml` – fast Criterion iterations
+- `benchmark_profiling.yaml` – balanced flamegraph runs
+- `benchmark_throughput.yaml` – high-load throughput checks
+
+Override the default preset with the `BENCH_CONFIG` environment variable:
+
+```bash
+BENCH_CONFIG=benches/configs/benchmark_throughput.yaml cargo bench
 ```
 
 ## Project Structure
@@ -134,6 +149,10 @@ rs_cdr_generator/
 │   ├── compression.rs       - Compression abstraction
 │   └── subscriber_db_redb.rs - Subscriber database
 ├── benches/                 - Criterion benchmarks
+│   ├── configs/             - Ready-to-use benchmark presets
+│   │   ├── benchmark_micro.yaml
+│   │   ├── benchmark_profiling.yaml
+│   │   └── benchmark_throughput.yaml
 │   ├── cdr_generation.rs
 │   ├── compression.rs
 │   ├── csv_writing.rs
