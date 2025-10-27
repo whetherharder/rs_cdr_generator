@@ -86,3 +86,20 @@ debug = true
 inherits = "release"
 debug = true
 strip = false
+
+# Benchmark configurations
+[[bench]]
+name = "cdr_generation"
+harness = false
+
+[[bench]]
+name = "compression"
+harness = false
+
+[[bench]]
+name = "csv_writing"
+harness = false
+
+[[bench]]
+name = "end_to_end"
+harness = false
