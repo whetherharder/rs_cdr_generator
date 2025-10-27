@@ -313,6 +313,11 @@ fn merge_config_value(config: &mut Config, key: &str, value: serde_yaml::Value) 
                 config.writer_tasks = v as usize;
             }
         }
+        "chunk_size" => {
+            if let Some(v) = value.as_u64() {
+                config.chunk_size = v as usize;
+            }
+        }
         "rotate_bytes" => {
             if let Some(v) = value.as_u64() {
                 config.rotate_bytes = v;

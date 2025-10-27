@@ -4,3 +4,4 @@ workers: 4
 rotate_bytes: 100000000
 tz_name: "Europe/Moscow"
 subscriber_db_redb_path: "test_db_1k.redb"
+chunk_size: 10000
