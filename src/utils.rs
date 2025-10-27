@@ -63,8 +63,8 @@ pub fn create_daily_summary(out_dir: &Path, day: &DateTime<Tz>) -> anyhow::Resul
     Ok(summary)
 }
 
-/// Combine all CDR shard files for a day and compress into a single .gz file
-pub fn bundle_day(out_dir: &Path, day: &DateTime<Tz>, cleanup: bool) -> anyhow::Result<PathBuf> {
+/// Combine all CDR shard files for a day into a single compressed file
+pub fn bundle_day(out_dir: &Path, day: &DateTime<Tz>, cleanup: bool, compression_ext: &str) -> anyhow::Result<PathBuf> {
     use rayon::prelude::*;
 
     let day_str = day.format("%Y-%m-%d").to_string();
@@ -75,12 +75,13 @@ pub fn bundle_day(out_dir: &Path, day: &DateTime<Tz>, cleanup: bool) -> anyhow::
     }
 
     // Collect all compressed CDR shard files (sorted by name for consistent ordering)
+    // Support both .gz and .zst extensions
     let mut cdr_files: Vec<_> = std::fs::read_dir(&day_dir)?
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            name_str.starts_with("cdr_") && name_str.ends_with(".csv.gz")
+            name_str.starts_with("cdr_") && (name_str.ends_with(".csv.gz") || name_str.ends_with(".csv.zst") || name_str.ends_with(".csv"))
         })
         .collect();
 
@@ -90,8 +91,8 @@ pub fn bundle_day(out_dir: &Path, day: &DateTime<Tz>, cleanup: bool) -> anyhow::
         anyhow::bail!("No CDR files found in directory: {:?}", day_dir);
     }
 
-    // Create final combined gzip file path
-    let gz_path = out_dir.join(format!("cdr_{}.csv.gz", day_str));
+    // Create final combined file path with appropriate extension
+    let output_path = out_dir.join(format!("cdr_{}.csv{}", day_str, compression_ext));
 
     // Phase 1: Parallel read - read all files into memory in parallel
     let file_contents: Vec<Vec<u8>> = cdr_files
@@ -103,14 +104,14 @@ pub fn bundle_day(out_dir: &Path, day: &DateTime<Tz>, cleanup: bool) -> anyhow::
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     // Phase 2: Sequential write - write all chunks in order
-    let mut output = File::create(&gz_path)?;
+    let mut output = File::create(&output_path)?;
     for chunk in &file_contents {
         std::io::Write::write_all(&mut output, chunk)?;
     }
 
     output.flush()?;
 
-    println!("Combined {} shard files into: {:?}", cdr_files.len(), gz_path);
+    println!("Combined {} shard files into: {:?}", cdr_files.len(), output_path);
 
     // Cleanup original shard files if requested
     if cleanup {
@@ -120,7 +121,7 @@ pub fn bundle_day(out_dir: &Path, day: &DateTime<Tz>, cleanup: bool) -> anyhow::
         println!("Cleaned up {} shard files", cdr_files.len());
     }
 
-    Ok(gz_path)
+    Ok(output_path)
 }
 
 #[cfg(test)]
@@ -176,7 +177,7 @@ mod tests {
         )
         .unwrap();
 
-        let gz_path = bundle_day(dir.path(), &day, false).unwrap();
+        let gz_path = bundle_day(dir.path(), &day, false, ".gz").unwrap();
         assert!(gz_path.exists());
         assert!(gz_path.to_string_lossy().ends_with(".csv.gz"));
         // Original shard files should still exist when cleanup=false
@@ -206,7 +207,7 @@ mod tests {
         )
         .unwrap();
 
-        let gz_path = bundle_day(dir.path(), &day, true).unwrap();
+        let gz_path = bundle_day(dir.path(), &day, true, ".gz").unwrap();
         assert!(gz_path.exists());
         assert!(gz_path.to_string_lossy().ends_with(".csv.gz"));
         // Original shard files should be deleted when cleanup=true

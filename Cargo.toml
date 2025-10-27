@@ -37,6 +37,7 @@ bincode = "1.3"
 
 # Compression/archiving
 flate2 = "1.0"
+zstd = { version = "0.13", features = ["zstdmt"] }  # Multi-threaded Zstd compression
 
 # Error handling
 anyhow = "1.0"

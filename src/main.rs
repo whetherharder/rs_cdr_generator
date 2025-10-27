@@ -394,6 +394,8 @@ fn main() -> anyhow::Result<()> {
             let out_dir = args.out.clone();
             let day_str_clone = day_str.clone();
             let rotate_bytes = cfg.rotate_bytes;
+            let compression_type = rs_cdr_generator::compression::CompressionType::from_str(&cfg.compression_type)
+                .unwrap_or(rs_cdr_generator::compression::CompressionType::Gzip);
 
             let handle = rt.spawn(async move {
                 writer_task(
@@ -402,6 +404,7 @@ fn main() -> anyhow::Result<()> {
                     day_str_clone,
                     shard_id,
                     rotate_bytes,
+                    compression_type,
                 )
                 .await
             });
@@ -434,7 +437,10 @@ fn main() -> anyhow::Result<()> {
 
         // Create summary and bundle
         create_daily_summary(&args.out, &day)?;
-        let tarfile_path = bundle_day(&args.out, &day, args.cleanup_after_archive)?;
+        let compression_ext = rs_cdr_generator::compression::CompressionType::from_str(&cfg.compression_type)
+            .unwrap_or(rs_cdr_generator::compression::CompressionType::Gzip)
+            .extension();
+        let tarfile_path = bundle_day(&args.out, &day, args.cleanup_after_archive, compression_ext)?;
 
         println!("Day {} done → {:?}", day_str, tarfile_path);
     }

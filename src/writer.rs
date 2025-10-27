@@ -1,11 +1,9 @@
 // CSV event writer with file rotation
 use csv::{Writer, WriterBuilder};
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use serde::Serialize;
 use std::fs::File;
-use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use crate::compression::{create_compressed_writer, CompressedWriter, CompressionType};
 
 // EventRow with primitive types for zero-copy performance
 // Serde will handle conversion to strings during serialization
@@ -174,21 +172,22 @@ impl EventRow {
 
 /// Manages rotating CSV files for CDR events
 /// Auto-rotates when file size exceeds threshold
-/// Each file is compressed on-the-fly with gzip
+/// Each file is compressed on-the-fly with the configured compression algorithm
 pub struct EventWriter {
     #[allow(dead_code)]
     out_dir: PathBuf,
     day_str: String,
     rotate_bytes: u64,
     part_num: u32,
-    current_writer: Option<Writer<GzEncoder<BufWriter<File>>>>,
+    current_writer: Option<Writer<Box<dyn CompressedWriter>>>,
     current_size: u64,
     day_dir: PathBuf,
     shard_id: usize,
+    compression_type: CompressionType,
 }
 
 impl EventWriter {
-    pub fn new(out_dir: &Path, day_str: &str, rotate_bytes: u64, shard_id: usize) -> anyhow::Result<Self> {
+    pub fn new(out_dir: &Path, day_str: &str, rotate_bytes: u64, shard_id: usize, compression_type: CompressionType) -> anyhow::Result<Self> {
         let day_dir = out_dir.join(day_str);
         std::fs::create_dir_all(&day_dir)?;
 
@@ -201,6 +200,7 @@ impl EventWriter {
             current_size: 0,
             day_dir,
             shard_id,
+            compression_type,
         };
 
         writer.open_new_file()?;
@@ -212,17 +212,17 @@ impl EventWriter {
         if let Some(mut writer) = self.current_writer.take() {
             writer.flush()?;
             // Finish compression
-            writer.into_inner()?.finish()?;
+            let mut inner = writer.into_inner().map_err(|e| anyhow::anyhow!("Failed to get inner writer: {}", e))?;
+            inner.finish_compression()?;
         }
 
-        let filename = format!("cdr_{}_shard{:03}_part{:03}.csv.gz", self.day_str, self.shard_id, self.part_num);
+        let extension = self.compression_type.extension();
+        let filename = format!("cdr_{}_shard{:03}_part{:03}.csv{}", self.day_str, self.shard_id, self.part_num, extension);
         let filepath = self.day_dir.join(&filename);
 
         let file = File::create(&filepath)?;
-        // Use 256KB buffer for better I/O performance
-        let buffered = BufWriter::with_capacity(256 * 1024, file);
-        // Compress on-the-fly in worker thread
-        let compressed = GzEncoder::new(buffered, Compression::default());
+        // Create compressed writer using factory function
+        let compressed = create_compressed_writer(file, self.compression_type)?;
 
         let wtr = WriterBuilder::new()
             .delimiter(b';')
@@ -247,7 +247,8 @@ impl EventWriter {
                 writer.flush()?;
 
                 // Get actual file size for accuracy
-                let filename = format!("cdr_{}_shard{:03}_part{:03}.csv.gz", self.day_str, self.shard_id, self.part_num);
+                let extension = self.compression_type.extension();
+                let filename = format!("cdr_{}_shard{:03}_part{:03}.csv{}", self.day_str, self.shard_id, self.part_num, extension);
                 let filepath = self.day_dir.join(&filename);
                 let actual_size = std::fs::metadata(&filepath)?.len();
 
@@ -268,7 +269,8 @@ impl EventWriter {
         if let Some(mut writer) = self.current_writer.take() {
             writer.flush()?;
             // Finish compression and flush all buffers
-            writer.into_inner()?.finish()?;
+            let mut inner = writer.into_inner().map_err(|e| anyhow::anyhow!("Failed to get inner writer: {}", e))?;
+            inner.finish_compression()?;
         }
         Ok(())
     }

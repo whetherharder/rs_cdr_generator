@@ -49,8 +49,9 @@ pub struct Config {
     // Special days (YYYY-MM-DD -> multiplier)
     pub special_days: HashMap<String, f64>,
 
-    // File rotation
+    // File rotation and compression
     pub rotate_bytes: u64,
+    pub compression_type: String,  // "gzip", "zstd", or "none"
 
     // Timezone
     pub tz_name: String,
@@ -151,6 +152,7 @@ impl Default for Config {
             seasonality,
             special_days: HashMap::new(),
             rotate_bytes: 100_000_000,
+            compression_type: "gzip".to_string(),  // Default to gzip for backward compatibility
             tz_name: DEFAULT_TZ_NAME.to_string(),
             workers: 0,
             event_pool_size: 10_000,           // 10K EventRow objects per worker
@@ -321,6 +323,11 @@ fn merge_config_value(config: &mut Config, key: &str, value: serde_yaml::Value) 
         "rotate_bytes" => {
             if let Some(v) = value.as_u64() {
                 config.rotate_bytes = v;
+            }
+        }
+        "compression_type" => {
+            if let Some(v) = value.as_str() {
+                config.compression_type = v.to_string();
             }
         }
         "db_size" => {

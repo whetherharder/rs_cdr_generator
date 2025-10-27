@@ -1,4 +1,5 @@
 // Async batched writer for CDR events using Tokio
+use crate::compression::CompressionType;
 use crate::writer::{EventRow, EventWriter};
 use anyhow::Result;
 use crossbeam_channel::Receiver;
@@ -55,10 +56,11 @@ pub async fn writer_task(
     day_str: String,
     shard_id: usize,
     rotate_bytes: u64,
+    compression_type: CompressionType,
 ) -> Result<()> {
     // Run in spawn_blocking since we're doing sync I/O with persistent writer
     tokio::task::spawn_blocking(move || {
-        writer_task_blocking(rx, out_dir, day_str, shard_id, rotate_bytes)
+        writer_task_blocking(rx, out_dir, day_str, shard_id, rotate_bytes, compression_type)
     })
     .await?
 }
@@ -70,9 +72,10 @@ fn writer_task_blocking(
     day_str: String,
     shard_id: usize,
     rotate_bytes: u64,
+    compression_type: CompressionType,
 ) -> Result<()> {
     // Create EventWriter once and reuse it for all batches (OPTIMIZATION #5)
-    let mut writer = EventWriter::new(&out_dir, &day_str, rotate_bytes, shard_id)?;
+    let mut writer = EventWriter::new(&out_dir, &day_str, rotate_bytes, shard_id, compression_type)?;
 
     let mut total_written = 0usize;
 
