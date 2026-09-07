@@ -4,17 +4,24 @@ use anyhow::Result;
 use crossbeam_channel::Receiver;
 use std::path::PathBuf;
 
-/// Batch of EventRow objects ready to be written
+/// Batch of EventRow objects ready to be written.
+///
+/// `date_compact` (YYYYMMDD) — все события в одной пачке принадлежат одному
+/// дню, потому что источник пачки (рабочий элемент параллелизма) всегда один
+/// день; храним дату на пачке, а не вычисляем её из события, чтобы не парсить
+/// `event_timestamp` в писателе.
 pub struct EventBatch {
     pub events: Vec<EventRow>,
     pub estimated_size: usize,
+    pub date_compact: String,
 }
 
 impl EventBatch {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, date_compact: &str) -> Self {
         EventBatch {
             events: Vec::with_capacity(capacity),
             estimated_size: 0,
+            date_compact: date_compact.to_string(),
         }
     }
 
@@ -44,26 +51,35 @@ impl EventBatch {
 /// Message types for async writer communication
 pub enum WriterMessage {
     Batch(EventBatch),
+    /// Все work item'ы конкретной даты (день × куски общего пула) отправили
+    /// свои пачки — можно закрыть (флашнуть gzip-трейлер) и снять с руки
+    /// файлы этой даты, не дожидаясь конца всего прогона. Без этого сигнала
+    /// writer-задача, живущая весь прогон (этап 5), держит открытыми файлы
+    /// ВСЕХ дней сразу — при 32 днях и 5 сетевых элементах это 160
+    /// одновременно открытых `NeFile`, и пик RSS растёт с числом дней в
+    /// прогоне (проверено: 2 дня → 315 МБ, 32 дня → 1236 МБ), хотя
+    /// параллельно обрабатывается не больше `--workers` work item'ов.
+    CloseDate(String),
     Close,
 }
 
 /// Async writer task, обрабатывающий пачки событий.
 /// Партиционирование по файлам — внутри EventWriter, по (ne_id, дата)
-/// (см. writer.rs); `date_str` обязан быть в формате YYYYMMDD.
-/// 🔴 При нескольких writer_tasks одновременно разные задачи этой функции
-/// могут получить события с одинаковым ne_id и независимо открыть/перезаписать
-/// один и тот же файл CDR_{ne_id}_{date}.csv.gz — маршрутизация round-robin
-/// идёт по индексу воркера (main.rs), а не по ne_id. Исправление требует
-/// перевода маршрутизации на ne_id, то есть правки архитектуры параллелизма
-/// (сознательно оставлено следующему этапу — docs/field-mapping.md).
+/// (см. writer.rs). Задача живёт весь прогон (все дни), а не один день,
+/// как раньше: параллелизм этапа 4 идёт по датам, и одна и та же
+/// writer-задача получает пачки за разные дни — дату берём из самой пачки
+/// (`EventBatch::date_compact`), а не фиксируем на входе.
+///
+/// Маршрутизация событий к writer-задаче — по ne_id (main.rs, `writer_idx`),
+/// поэтому каждую пару (ne_id, дата) пишет ровно одна задача: коллизии
+/// открытия файла нет, и `writer_tasks > 1` больше не запрещён (этап 5).
 pub async fn writer_task(
     rx: Receiver<WriterMessage>,
     out_dir: PathBuf,
-    date_str: String,
     shard_id: usize,
 ) -> Result<()> {
     // Run in spawn_blocking since we're doing sync I/O with persistent writer
-    tokio::task::spawn_blocking(move || writer_task_blocking(rx, out_dir, date_str, shard_id))
+    tokio::task::spawn_blocking(move || writer_task_blocking(rx, out_dir, shard_id))
         .await?
 }
 
@@ -71,11 +87,10 @@ pub async fn writer_task(
 fn writer_task_blocking(
     rx: Receiver<WriterMessage>,
     out_dir: PathBuf,
-    date_str: String,
     shard_id: usize,
 ) -> Result<()> {
     // Create EventWriter once and reuse it for all batches (OPTIMIZATION #5)
-    let mut writer = EventWriter::new(&out_dir, &date_str)?;
+    let mut writer = EventWriter::new(&out_dir)?;
 
     let mut total_written = 0usize;
 
@@ -94,10 +109,13 @@ fn writer_task_blocking(
 
                 // Write all events in batch using persistent writer (OPTIMIZATION #5)
                 for event in &batch.events {
-                    writer.write_row(&event.serving_ne_id, event)?;
+                    writer.write_row(&event.serving_ne_id, &batch.date_compact, event)?;
                 }
 
                 total_written += batch.len();
+            }
+            WriterMessage::CloseDate(date_str) => {
+                writer.close_date(&date_str)?;
             }
             WriterMessage::Close => {
                 break;
@@ -123,7 +141,7 @@ mod tests {
 
     #[test]
     fn test_event_batch() {
-        let mut batch = EventBatch::new(100);
+        let mut batch = EventBatch::new(100, "20250101");
         assert_eq!(batch.len(), 0);
         assert!(batch.is_empty());
 
@@ -136,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_batch_full() {
-        let mut batch = EventBatch::new(10);
+        let mut batch = EventBatch::new(10, "20250101");
         let max_size = 1000;
 
         // Add events until full

@@ -5,12 +5,10 @@
 // (эталон, читать, не править). Таблица соответствий полей — docs/field-mapping.md.
 //
 // Партиционирование вывода — по паре (ne_id, дата), как у питоновского CsvWriter
-// (writer/csv_writer.py, CDR_{ne_id}_{date}.csv.gz), а не по диапазону абонентов,
-// как было раньше. См. docs/field-mapping.md, раздел «Ограничение этого этапа»:
-// при нескольких writer_tasks файлы одного (ne_id, дата) могут открываться
-// параллельно разными задачами — это требует маршрутизации событий к
-// writer-задачам по ne_id вместо текущего round-robin по воркеру, то есть
-// правки архитектуры параллелизма, которая в этот этап не входит.
+// (writer/csv_writer.py, CDR_{ne_id}_{date}.csv.gz), а не по диапазону абонентов.
+// Этап 5: события маршрутизируются к writer-задаче по ne_id (main.rs), поэтому
+// каждую пару (ne_id, дата) пишет ровно одна задача — коллизии открытия файла
+// больше нет, и жёсткий отказ на writer_tasks > 1 снят.
 use csv::{Terminator, Writer, WriterBuilder};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -161,45 +159,69 @@ pub const CDR_FIELDS: &[&str] = &[
 ];
 
 /// Писатель CDR-событий одной writer-задачи: держит по одному открытому файлу
-/// на каждый встреченный ne_id за день, партиционируя строки по (ne_id, дата).
+/// на каждую встреченную пару (ne_id, дата), партиционируя строки по ней.
+///
+/// Этап 4/5: параллелизм переведён на даты, и одна writer-задача теперь
+/// живёт весь прогон (а не один день, как раньше) — значит через неё за
+/// время жизни проходят события НЕСКОЛЬКИХ дат, и дата больше не может быть
+/// полем самого писателя. Ключ файловой карты — (ne_id, date_str).
 pub struct EventWriter {
     out_dir: PathBuf,
-    date_str: String, // YYYYMMDD, как в имени файла питоновского эталона
-    files: HashMap<String, NeFile>,
+    files: HashMap<(String, String), NeFile>,
 }
 
 impl EventWriter {
-    /// `date_str` уже должен быть в формате YYYYMMDD (не "%Y-%m-%d") —
-    /// именно так его подставляет питоновский CsvWriter в имя файла.
-    pub fn new(out_dir: &Path, date_str: &str) -> anyhow::Result<Self> {
+    pub fn new(out_dir: &Path) -> anyhow::Result<Self> {
         Ok(EventWriter {
             out_dir: out_dir.to_path_buf(),
-            date_str: date_str.to_string(),
             files: HashMap::new(),
         })
     }
 
-    fn resolve_path(&self, ne_id: &str) -> PathBuf {
+    fn resolve_path(&self, ne_id: &str, date_str: &str) -> PathBuf {
         // out_dir/ne_id/CDR_{ne_id}_{date}.csv.gz — как _resolve_path в эталоне.
         self.out_dir
             .join(ne_id)
-            .join(format!("CDR_{}_{}.csv.gz", ne_id, self.date_str))
+            .join(format!("CDR_{}_{}.csv.gz", ne_id, date_str))
     }
 
-    pub fn write_row(&mut self, ne_id: &str, row: &EventRow) -> anyhow::Result<()> {
-        if !self.files.contains_key(ne_id) {
-            let path = self.resolve_path(ne_id);
+    /// `date_str` уже должен быть в формате YYYYMMDD (не "%Y-%m-%d") —
+    /// именно так его подставляет питоновский CsvWriter в имя файла.
+    pub fn write_row(&mut self, ne_id: &str, date_str: &str, row: &EventRow) -> anyhow::Result<()> {
+        let key = (ne_id.to_string(), date_str.to_string());
+        if !self.files.contains_key(&key) {
+            let path = self.resolve_path(ne_id, date_str);
             let mut f = NeFile::create(&path)?;
             f.write_header()?;
-            self.files.insert(ne_id.to_string(), f);
+            self.files.insert(key.clone(), f);
         }
-        let f = self.files.get_mut(ne_id).unwrap();
+        let f = self.files.get_mut(&key).unwrap();
         f.write_row(row)
     }
 
     pub fn close(&mut self) -> anyhow::Result<()> {
         for (_, f) in self.files.iter_mut() {
             f.close()?;
+        }
+        Ok(())
+    }
+
+    /// Закрывает и снимает с руки файлы КОНКРЕТНОЙ даты (по всем ne_id,
+    /// встреченным в ней), не трогая файлы других дат. Позволяет писателю,
+    /// который живёт весь многодневный прогон (этап 5), не держать открытыми
+    /// файлы всех дней сразу — тот самый источник пика RSS, растущего
+    /// с числом дней в прогоне.
+    pub fn close_date(&mut self, date_str: &str) -> anyhow::Result<()> {
+        let keys: Vec<(String, String)> = self
+            .files
+            .keys()
+            .filter(|(_, d)| d == date_str)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(mut f) = self.files.remove(&key) {
+                f.close()?;
+            }
         }
         Ok(())
     }
@@ -219,23 +241,21 @@ mod tests {
 
     /// Сквозная проверка формата: писатель должен дать имя файла, разделитель
     /// и заголовок ровно как у питоновского эталона (writer/csv_writer.py).
-    /// Прогон через CLI недоступен для проверки этого критерия отдельно —
-    /// generate-cdr завязан на предсуществующее несовпадение схемы MSISDN
-    /// между generate-subscribers и chunked-читателем (worker_generate_redb_chunked,
-    /// generators.rs): candidate msisdn там строится по индексу абонента,
-    /// а generate-subscribers пишет в базу случайный msisdn, так что
-    /// подстановка почти никогда не совпадает и событий не генерируется.
-    /// Это отдельный, предсуществующий дефект вне области этой правки.
+    /// Раньше здесь была оговорка про несовпадение схемы MSISDN между
+    /// generate-subscribers и chunked-читателем — дефект устранён этапом 3
+    /// (worker_generate_redb_chunked теперь берёт реальные MSISDN из базы,
+    /// а не вычисляет их по индексу), сквозной прогон через CLI проверяется
+    /// отдельно (docs/field-mapping.md).
     #[test]
     fn header_matches_python_reference_format() {
         let dir = tempfile::tempdir().unwrap();
-        let mut w = EventWriter::new(dir.path(), "20250305").unwrap();
+        let mut w = EventWriter::new(dir.path()).unwrap();
 
         let mut row = EventRow::default();
         row.record_type = "mo_call".to_string();
         row.served_imsi = "434050000001".to_string();
         row.served_msisdn = "998900000001".to_string();
-        w.write_row("msc-01", &row).unwrap();
+        w.write_row("msc-01", "20250305", &row).unwrap();
         w.close().unwrap();
 
         let path = dir.path().join("msc-01").join("CDR_msc-01_20250305.csv.gz");

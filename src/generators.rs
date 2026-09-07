@@ -17,6 +17,7 @@ use rand_distr::{Distribution, LogNormal, Normal};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Отдаёт serving_ne_id для АБОНЕНТА (не для соты и не для события).
 ///
@@ -524,7 +525,11 @@ pub struct ShardStats {
     pub data: usize,
 }
 
-/// Worker process that generates events for a shard of users
+/// Worker process for the CSV-путь (устаревший, не достижим через CLI —
+/// generate-cdr всегда открывает redb-базу и работает через
+/// `worker_generate_shard`, см. main.rs). Оставлен как есть, вне области
+/// этапов 3–5: правки на реальную выборку абонентов и общий пул контактов
+/// применены только к достижимому redb-пути.
 pub fn worker_generate(
     day: DateTime<chrono_tz::Tz>,
     shard_id: usize,
@@ -532,22 +537,8 @@ pub fn worker_generate(
     cfg: &Config,
     out_dir: &Path,
     subscriber_db_path: Option<&Path>,
-    redb: Option<&std::sync::Arc<SubscriberDbRedb>>,
     writer_tx: Sender<WriterMessage>,
 ) -> anyhow::Result<()> {
-    // If redb database is provided, use chunked processing for memory efficiency
-    if let Some(redb_arc) = redb {
-        return worker_generate_redb_chunked(
-            day,
-            shard_id,
-            users_range,
-            cfg,
-            out_dir,
-            redb_arc.clone(),
-            writer_tx,
-        );
-    }
-
     use chrono::Duration;
 
     let seed = (cfg.workers as u64).wrapping_mul(1000) + shard_id as u64;
@@ -633,13 +624,14 @@ pub fn worker_generate(
     let data_gen = DataGenerator::new(HashMap::new(), vec![], cfg.network_elements.clone());
 
     let day_str = day.format("%Y-%m-%d").to_string();
+    let date_compact = day.format("%Y%m%d").to_string();
 
     // Initialize event pool for zero-allocation event generation
     let mut event_pool = EventPool::new(cfg.event_pool_size);
 
     // Initialize batch for async writing
     let batch_capacity = cfg.batch_size_bytes / 230; // ~230 bytes per event
-    let mut batch = EventBatch::new(batch_capacity);
+    let mut batch = EventBatch::new(batch_capacity, &date_compact);
 
     let day_start_local = tz
         .with_ymd_and_hms(day.year(), day.month(), day.day(), 0, 0, 0)
@@ -726,7 +718,7 @@ pub fn worker_generate(
             // Send batch if full
             if batch.is_full(cfg.batch_size_bytes) {
                 writer_tx.send(WriterMessage::Batch(batch))?;
-                batch = EventBatch::new(batch_capacity);
+                batch = EventBatch::new(batch_capacity, &date_compact);
             }
 
             // If other party is in our database, generate correlated MT (Mobile Terminated) record
@@ -765,7 +757,7 @@ pub fn worker_generate(
                 // Send batch if full
                 if batch.is_full(cfg.batch_size_bytes) {
                     writer_tx.send(WriterMessage::Batch(batch))?;
-                    batch = EventBatch::new(batch_capacity);
+                    batch = EventBatch::new(batch_capacity, &date_compact);
                 }
             }
         }
@@ -805,7 +797,7 @@ pub fn worker_generate(
             // Send batch if full
             if batch.is_full(cfg.batch_size_bytes) {
                 writer_tx.send(WriterMessage::Batch(batch))?;
-                batch = EventBatch::new(batch_capacity);
+                batch = EventBatch::new(batch_capacity, &date_compact);
             }
         }
 
@@ -830,7 +822,7 @@ pub fn worker_generate(
             // Send batch if full
             if batch.is_full(cfg.batch_size_bytes) {
                 writer_tx.send(WriterMessage::Batch(batch))?;
-                batch = EventBatch::new(batch_capacity);
+                batch = EventBatch::new(batch_capacity, &date_compact);
             }
         }
     }
@@ -852,20 +844,50 @@ pub fn worker_generate(
     Ok(())
 }
 
-/// Worker process with redb-based chunked processing for memory efficiency
-/// This version loads subscribers in small chunks to minimize memory usage
-fn worker_generate_redb_chunked(
+/// Один рабочий элемент параллелизма этапа 4: (день, диапазон индексов
+/// в ОБЩЕМ пуле абонентов `all_msisdns`). Ось параллелизма — даты (и внутри
+/// дня — куски общего пула, чтобы rayon было чем занять воркеры даже при
+/// одном-двух днях в прогоне), а не диапазон абонентов на воркер, как было
+/// раньше: старая схема давала каждому воркеру СВОЙ диапазон абонентов на
+/// весь прогон, из-за чего звонок собеседнику выбирался внутри того же
+/// диапазона в 70% случаев (generators.rs, `other_msisdn`) — граф контактов
+/// получался разреженным по границам диапазонов, а не по реальному кругу
+/// общения (docs/field-mapping.md, задание этапа 4).
+///
+/// `all_msisdns` — реальные MSISDN абонентов из redb (этап 3: раньше здесь
+/// вычисляли MSISDN арифметически из индекса и почти никогда не находили
+/// абонента в базе), общие на весь прогон и видимые каждому воркеру целиком
+/// — так собеседник звонка выбирается из ВСЕГО пула, а не из своего куска.
+///
+/// `writer_channels` — несколько writer-задач (этап 5): событие маршрутизируется
+/// по индексу serving_ne_id обслуженного абонента, поэтому каждую пару
+/// (ne_id, дата) пишет ровно одна задача независимо от того, сколько работ
+/// (день, кусок пула) отправили в неё события.
+#[allow(clippy::too_many_arguments)]
+pub fn worker_generate_shard(
     day: DateTime<chrono_tz::Tz>,
-    shard_id: usize,
-    users_range: (usize, usize),
+    day_idx: usize,
+    chunk_idx: usize,
+    idx_range: (usize, usize),
+    all_msisdns: &Arc<Vec<u64>>,
     cfg: &Config,
     out_dir: &Path,
-    redb: std::sync::Arc<SubscriberDbRedb>,
-    writer_tx: Sender<WriterMessage>,
+    redb: &Arc<SubscriberDbRedb>,
+    writer_channels: &[Sender<WriterMessage>],
+    base_seed: u64,
 ) -> anyhow::Result<()> {
     use chrono::Duration;
 
-    let seed = (cfg.workers as u64).wrapping_mul(1000) + shard_id as u64;
+    // Seed воркера привязан к дате: без этого (старая формула — только
+    // workers*1000 + shard_id, без дня) все дни при переносе параллелизма
+    // на даты получили бы одинаковый seed и стали бы похожи друг на друга
+    // (задание этапа 4, «ДЕТЕРМИНИЗМ»). Формула: базовый seed прогона плюс
+    // вклад дня (крупный множитель, чтобы дни не пересекались) плюс вклад
+    // куска пула внутри дня (мелкий множитель — кусков на порядки меньше,
+    // чем 1_000_000).
+    let seed = base_seed
+        .wrapping_add((day_idx as u64).wrapping_mul(1_000_000))
+        .wrapping_add(chunk_idx as u64);
     let mut rng = StdRng::seed_from_u64(seed);
 
     let tz = tz_from_name(&cfg.tz_name);
@@ -877,13 +899,37 @@ fn worker_generate_redb_chunked(
     let data_gen = DataGenerator::new(HashMap::new(), vec![], cfg.network_elements.clone());
 
     let day_str = day.format("%Y-%m-%d").to_string();
+    let date_compact = day.format("%Y%m%d").to_string();
 
     // Initialize event pool
     let mut event_pool = EventPool::new(cfg.event_pool_size);
 
-    // Initialize batch
+    // Этап 5: своя пачка на каждую writer-задачу, а не одна общая — событие
+    // маршрутизируется по serving_ne_id обслуженного абонента (см. ниже,
+    // route_writer_idx), и разным ne_id может достаться разная задача.
     let batch_capacity = cfg.batch_size_bytes / 230;
-    let mut batch = EventBatch::new(batch_capacity);
+    let mut batches: Vec<EventBatch> = (0..writer_channels.len())
+        .map(|_| EventBatch::new(batch_capacity, &date_compact))
+        .collect();
+
+    // Индекс сетевого элемента абонента → индекс writer-задачи. Тот же
+    // хеш, что и assign_ne_id (msisdn % network_elements.len()), поэтому
+    // маршрутизация согласована с serving_ne_id, который реально попадёт
+    // в событие: одну пару (ne_id, дата) всегда пишет одна и та же задача.
+    let network_elements_len = cfg.network_elements.len().max(1);
+    let writer_tasks = writer_channels.len().max(1);
+    let route_writer_idx = |served_msisdn: u64| -> usize {
+        let ne_idx = (served_msisdn as usize) % network_elements_len;
+        ne_idx % writer_tasks
+    };
+    macro_rules! flush_if_full {
+        ($idx:expr) => {
+            if batches[$idx].is_full(cfg.batch_size_bytes) {
+                let full = std::mem::replace(&mut batches[$idx], EventBatch::new(batch_capacity, &date_compact));
+                writer_channels[$idx].send(WriterMessage::Batch(full))?;
+            }
+        };
+    }
 
     let day_start_local = tz
         .with_ymd_and_hms(day.year(), day.month(), day.day(), 0, 0, 0)
@@ -892,7 +938,7 @@ fn worker_generate_redb_chunked(
     let day_start_ts = day.timestamp_millis();
 
     let mut stats = ShardStats {
-        shard: shard_id,
+        shard: chunk_idx,
         calls: 0,
         sms: 0,
         data: 0,
@@ -921,231 +967,195 @@ fn worker_generate_redb_chunked(
         day_start_local + Duration::seconds(offset_secs)
     };
 
-    // Parse prefixes to u64 for numeric operations
+    // Префиксы численно — для 30%-й ветки «внешний номер» (не из базы).
     let numeric_prefixes: Vec<u64> = cfg.prefixes
         .iter()
         .map(|s| s.parse().unwrap_or(31612))
         .collect();
 
-    // Calculate total subscriber range for this worker
-    let (start_u, end_u) = users_range;
-    let total_subs = end_u - start_u;
+    // Диапазон индексов в ОБЩЕМ пуле all_msisdns, обрабатываемый этим work
+    // item'ом (этап 3+4: реальные ключи, а не арифметика по индексу; кусок
+    // общего пула, а не персональный диапазон воркера).
+    let (chunk_start_idx, chunk_end_idx) = idx_range;
+    if chunk_start_idx >= chunk_end_idx {
+        return Ok(());
+    }
+    let chunk_msisdns = &all_msisdns[chunk_start_idx..chunk_end_idx];
 
-    // Calculate MSISDN range for this worker
-    let start_msisdn_idx = start_u;
-    let end_msisdn_idx = end_u;
+    // all_msisdns отсортирован по возрастанию (redb хранит ключи как
+    // B-дерево) — min/max смежного среза совпадают с его границами,
+    // load_chunk вернёт ровно эти записи и ни одной лишней.
+    let min_msisdn = chunk_msisdns[0];
+    let max_msisdn = chunk_msisdns[chunk_msisdns.len() - 1];
 
-    // Process subscribers in chunks
-    let chunk_size = cfg.chunk_size;
-    for chunk_start_idx in (0..total_subs).step_by(chunk_size) {
-        let chunk_end_idx = (chunk_start_idx + chunk_size).min(total_subs);
+    // Load chunk from redb in one transaction (OPTIMIZATION #1)
+    let chunk_data = redb.load_chunk(min_msisdn, max_msisdn + 1)?;
 
-        // Calculate MSISDN range for this chunk
-        let chunk_start_sub = start_msisdn_idx + chunk_start_idx;
-        let chunk_end_sub = start_msisdn_idx + chunk_end_idx;
+    // Build HashMap for O(1) lookup (OPTIMIZATION #1)
+    let snapshot_cache: HashMap<u64, Vec<crate::subscriber_db_redb::SubscriberSnapshotNumeric>> =
+        chunk_data.into_iter().collect();
 
-        // Calculate min and max MSISDN for efficient range query
-        let mut min_msisdn = u64::MAX;
-        let mut max_msisdn = 0u64;
+    // Build subscriber list for this chunk using cache — по реальным
+    // ключам, поэтому попадание в кеш теперь не случайность, а гарантия
+    // (этап 3): каждый msisdn из chunk_msisdns реально есть в базе.
+    let mut chunk_subs = Vec::with_capacity(chunk_msisdns.len());
 
-        for sub_idx in chunk_start_sub..chunk_end_sub {
-            let prefix_idx = sub_idx % cfg.prefixes.len();
-            let prefix = numeric_prefixes[prefix_idx];
-            let number = (sub_idx % 10_000_000) as u64;
-            let msisdn = prefix * 10_000_000 + number;
-            min_msisdn = min_msisdn.min(msisdn);
-            max_msisdn = max_msisdn.max(msisdn);
+    for &msisdn in chunk_msisdns {
+        if let Some(snapshots) = snapshot_cache.get(&msisdn) {
+            if let Some(snapshot) = crate::subscriber_db_redb::SubscriberDbRedb::find_snapshot_at(snapshots, day_start_ts) {
+                chunk_subs.push(Subscriber {
+                    msisdn: snapshot.msisdn,
+                    imsi: snapshot.imsi,
+                    imei: snapshot.imei,
+                    mccmnc: snapshot.mccmnc,
+                });
+            }
+        }
+    }
+
+    // Generate events for this chunk
+    for sub in &chunk_subs {
+        if sub.msisdn == 0 {
+            continue;
         }
 
-        // Load chunk from redb in one transaction (OPTIMIZATION #1)
-        let chunk_data = redb.load_chunk(min_msisdn, max_msisdn + 1)?;
+        // Sample event counts for this user (OPTIMIZATION #4)
+        let n_calls = calls_sampler.sample(&mut rng);
+        let n_sms = sms_sampler.sample(&mut rng);
+        let n_data = data_sampler.sample(&mut rng);
 
-        // Build HashMap for O(1) lookup (OPTIMIZATION #1)
-        let snapshot_cache: HashMap<u64, Vec<crate::subscriber_db_redb::SubscriberSnapshotNumeric>> =
-            chunk_data.into_iter().collect();
+        // Generate CALL events
+        for _ in 0..n_calls {
+            let start_local = sample_time(&mut rng);
 
-        // Build subscriber list for this chunk using cache
-        let mut chunk_subs = Vec::with_capacity((chunk_end_idx - chunk_start_idx) as usize);
+            // Этап 4, требование 3: собеседник звонка — из ОБЩЕГО пула
+            // абонентов all_msisdns (видимого каждому work item целиком),
+            // а не из диапазона своего воркера/куска — иначе граф контактов
+            // разрежен границами шардов (см. докстринг функции выше).
+            // 30% — номер вне базы (другой оператор), как и раньше: MT-запись
+            // для него не генерируется (см. lookup ниже).
+            let other_msisdn: u64 = if rng.gen::<f64>() < 0.7 {
+                all_msisdns[rng.gen_range(0..all_msisdns.len())]
+            } else {
+                let prefix_idx = rng.gen_range(0..numeric_prefixes.len());
+                let prefix = numeric_prefixes[prefix_idx];
+                let subscriber_number = rng.gen_range(0..10_000_000u64);
+                prefix * 10_000_000 + subscriber_number
+            };
 
-        for sub_idx in chunk_start_sub..chunk_end_sub {
-            // Generate MSISDN using arithmetic (OPTIMIZATION #3 - partial)
-            let prefix_idx = sub_idx % cfg.prefixes.len();
-            let prefix = numeric_prefixes[prefix_idx];
-            let number = (sub_idx % 10_000_000) as u64;
-            let msisdn = prefix * 10_000_000 + number;
+            let cell_id = rng.gen_range(10_000..100_000);
 
-            // Look up subscriber in cache (OPTIMIZATION #1)
-            if let Some(snapshots) = snapshot_cache.get(&msisdn) {
-                if let Some(snapshot) = crate::subscriber_db_redb::SubscriberDbRedb::find_snapshot_at(snapshots, day_start_ts) {
-                    chunk_subs.push(Subscriber {
-                        msisdn: snapshot.msisdn,
-                        imsi: snapshot.imsi,
-                        imei: snapshot.imei,
-                        mccmnc: snapshot.mccmnc,
-                    });
+            // Generate MO record
+            let mo_event = event_pool.acquire();
+            call_gen.generate_forced_direction(
+                mo_event,
+                sub,
+                start_local,
+                other_msisdn,
+                tz_name,
+                cell_id,
+                &mut rng,
+                "MO",
+            );
+
+            let mo_idx = route_writer_idx(sub.msisdn);
+            batches[mo_idx].push(mo_event.clone());
+            stats.calls += 1;
+            flush_if_full!(mo_idx);
+
+            // Check if other party is in database for MT generation
+            // First check cache, fallback to DB for out-of-chunk MSISDNs (OPTIMIZATION #1)
+            let other_snapshot_opt = if let Some(snapshots) = snapshot_cache.get(&other_msisdn) {
+                crate::subscriber_db_redb::SubscriberDbRedb::find_snapshot_at(snapshots, day_start_ts).cloned()
+            } else {
+                // Fallback: MSISDN is outside current chunk, use DB lookup
+                redb.get_subscriber_at(other_msisdn, day_start_ts)?
+            };
+
+            if let Some(ref other_snapshot) = other_snapshot_opt {
+                if other_snapshot.msisdn == 0 {
+                    continue;
                 }
-            }
-        }
 
-        // Generate events for this chunk
-        for sub in &chunk_subs {
-            if sub.msisdn == 0 {
-                continue;
-            }
+                // Save parameters for MT correlation
+                let event_timestamp = mo_event.event_timestamp.clone();
+                let release_timestamp = mo_event.release_timestamp.clone();
+                let duration_seconds = mo_event.duration_seconds.clone();
 
-            // Sample event counts for this user (OPTIMIZATION #4)
-            let n_calls = calls_sampler.sample(&mut rng);
-            let n_sms = sms_sampler.sample(&mut rng);
-            let n_data = data_sampler.sample(&mut rng);
+                // Generate correlated MT record
+                let mt_event = event_pool.acquire();
+                mt_event.record_type = cdr_record_type("CALL", "MT").to_string();
+                mt_event.served_imsi = other_snapshot.imsi.to_string();
+                mt_event.served_msisdn = other_snapshot.msisdn.to_string();
+                mt_event.served_imei = other_snapshot.imei.to_string();
+                mt_event.calling_number = other_msisdn.to_string();
+                mt_event.called_number = sub.msisdn.to_string();
+                mt_event.event_timestamp = event_timestamp;
+                mt_event.release_timestamp = release_timestamp;
+                mt_event.duration_seconds = duration_seconds;
+                mt_event.first_cell_id = cell_id.to_string();
+                mt_event.last_cell_id = cell_id.to_string();
+                mt_event.serving_ne_id = assign_ne_id(other_snapshot.msisdn, &cfg.network_elements);
 
-            // Generate CALL events
-            for _ in 0..n_calls {
-                let start_local = sample_time(&mut rng);
-
-                // Generate random contact MSISDN using arithmetic (OPTIMIZATION #3)
-                let other_msisdn: u64 = if rng.gen::<f64>() < 0.7 {
-                    // Generate from our subscriber range (may or may not be in DB)
-                    let random_idx = rng.gen_range(start_msisdn_idx..end_msisdn_idx);
-                    let prefix_idx = random_idx % cfg.prefixes.len();
-                    let prefix = numeric_prefixes[prefix_idx];
-                    let number = (random_idx % 10_000_000) as u64;
-                    prefix * 10_000_000 + number
-                } else {
-                    // Generate external number
-                    let prefix_idx = rng.gen_range(0..numeric_prefixes.len());
-                    let prefix = numeric_prefixes[prefix_idx];
-                    let subscriber_number = rng.gen_range(0..10_000_000u64);
-                    prefix * 10_000_000 + subscriber_number
-                };
-
-                let cell_id = rng.gen_range(10_000..100_000);
-
-                // Generate MO record
-                let mo_event = event_pool.acquire();
-                call_gen.generate_forced_direction(
-                    mo_event,
-                    sub,
-                    start_local,
-                    other_msisdn,
-                    tz_name,
-                    cell_id,
-                    &mut rng,
-                    "MO",
-                );
-
-                batch.push(mo_event.clone());
+                let mt_idx = route_writer_idx(other_snapshot.msisdn);
+                batches[mt_idx].push(mt_event.clone());
                 stats.calls += 1;
-
-                if batch.is_full(cfg.batch_size_bytes) {
-                    writer_tx.send(WriterMessage::Batch(batch))?;
-                    batch = EventBatch::new(batch_capacity);
-                }
-
-                // Check if other party is in database for MT generation
-                // First check cache, fallback to DB for out-of-chunk MSISDNs (OPTIMIZATION #1)
-                let other_snapshot_opt = if let Some(snapshots) = snapshot_cache.get(&other_msisdn) {
-                    crate::subscriber_db_redb::SubscriberDbRedb::find_snapshot_at(snapshots, day_start_ts).cloned()
-                } else {
-                    // Fallback: MSISDN is outside current chunk, use DB lookup
-                    redb.get_subscriber_at(other_msisdn, day_start_ts)?
-                };
-
-                if let Some(ref other_snapshot) = other_snapshot_opt {
-                    if other_snapshot.msisdn == 0 {
-                        continue;
-                    }
-
-                    // Save parameters for MT correlation
-                    let event_timestamp = mo_event.event_timestamp.clone();
-                    let release_timestamp = mo_event.release_timestamp.clone();
-                    let duration_seconds = mo_event.duration_seconds.clone();
-
-                    // Generate correlated MT record
-                    let mt_event = event_pool.acquire();
-                    mt_event.record_type = cdr_record_type("CALL", "MT").to_string();
-                    mt_event.served_imsi = other_snapshot.imsi.to_string();
-                    mt_event.served_msisdn = other_snapshot.msisdn.to_string();
-                    mt_event.served_imei = other_snapshot.imei.to_string();
-                    mt_event.calling_number = other_msisdn.to_string();
-                    mt_event.called_number = sub.msisdn.to_string();
-                    mt_event.event_timestamp = event_timestamp;
-                    mt_event.release_timestamp = release_timestamp;
-                    mt_event.duration_seconds = duration_seconds;
-                    mt_event.first_cell_id = cell_id.to_string();
-                    mt_event.last_cell_id = cell_id.to_string();
-                    mt_event.serving_ne_id = assign_ne_id(other_snapshot.msisdn, &cfg.network_elements);
-
-                    batch.push(mt_event.clone());
-                    stats.calls += 1;
-
-                    if batch.is_full(cfg.batch_size_bytes) {
-                        writer_tx.send(WriterMessage::Batch(batch))?;
-                        batch = EventBatch::new(batch_capacity);
-                    }
-                }
-            }
-
-            // Generate SMS events
-            for _ in 0..n_sms {
-                let start_local = sample_time(&mut rng);
-
-                // Generate random contact MSISDN using arithmetic (OPTIMIZATION #3)
-                let other_msisdn: u64 = if rng.gen::<f64>() < 0.7 {
-                    let random_idx = rng.gen_range(start_msisdn_idx..end_msisdn_idx);
-                    let prefix_idx = random_idx % cfg.prefixes.len();
-                    let prefix = numeric_prefixes[prefix_idx];
-                    let number = (random_idx % 10_000_000) as u64;
-                    prefix * 10_000_000 + number
-                } else {
-                    let prefix_idx = rng.gen_range(0..numeric_prefixes.len());
-                    let prefix = numeric_prefixes[prefix_idx];
-                    let subscriber_number = rng.gen_range(0..10_000_000u64);
-                    prefix * 10_000_000 + subscriber_number
-                };
-
-                let cell_id = rng.gen_range(10_000..100_000);
-
-                let event = event_pool.acquire();
-                sms_gen.generate(event, sub, start_local, other_msisdn, tz_name, cell_id, &mut rng);
-
-                batch.push(event.clone());
-                stats.sms += 1;
-
-                if batch.is_full(cfg.batch_size_bytes) {
-                    writer_tx.send(WriterMessage::Batch(batch))?;
-                    batch = EventBatch::new(batch_capacity);
-                }
-            }
-
-            // Generate DATA events
-            for _ in 0..n_data {
-                let start_local = sample_time(&mut rng);
-
-                let event = event_pool.acquire();
-                data_gen.generate(event, sub, start_local, tz_name, &mut rng);
-
-                batch.push(event.clone());
-                stats.data += 1;
-
-                if batch.is_full(cfg.batch_size_bytes) {
-                    writer_tx.send(WriterMessage::Batch(batch))?;
-                    batch = EventBatch::new(batch_capacity);
-                }
+                flush_if_full!(mt_idx);
             }
         }
 
-        // Chunk is dropped here, memory released
+        // Generate SMS events
+        for _ in 0..n_sms {
+            let start_local = sample_time(&mut rng);
+
+            // Тот же общий пул для собеседника, что и у звонков (этап 4).
+            let other_msisdn: u64 = if rng.gen::<f64>() < 0.7 {
+                all_msisdns[rng.gen_range(0..all_msisdns.len())]
+            } else {
+                let prefix_idx = rng.gen_range(0..numeric_prefixes.len());
+                let prefix = numeric_prefixes[prefix_idx];
+                let subscriber_number = rng.gen_range(0..10_000_000u64);
+                prefix * 10_000_000 + subscriber_number
+            };
+
+            let cell_id = rng.gen_range(10_000..100_000);
+
+            let event = event_pool.acquire();
+            sms_gen.generate(event, sub, start_local, other_msisdn, tz_name, cell_id, &mut rng);
+
+            let idx = route_writer_idx(sub.msisdn);
+            batches[idx].push(event.clone());
+            stats.sms += 1;
+            flush_if_full!(idx);
+        }
+
+        // Generate DATA events
+        for _ in 0..n_data {
+            let start_local = sample_time(&mut rng);
+
+            let event = event_pool.acquire();
+            data_gen.generate(event, sub, start_local, tz_name, &mut rng);
+
+            let idx = route_writer_idx(sub.msisdn);
+            batches[idx].push(event.clone());
+            stats.data += 1;
+            flush_if_full!(idx);
+        }
     }
 
-    // Send remaining batch
-    if !batch.is_empty() {
-        writer_tx.send(WriterMessage::Batch(batch))?;
+    // Send remaining batches
+    for (idx, batch) in batches.into_iter().enumerate() {
+        if !batch.is_empty() {
+            writer_channels[idx].send(WriterMessage::Batch(batch))?;
+        }
     }
 
-    // Write stats
+    // Write stats — имя файла включает и день, и кусок пула: при
+    // параллелизме по датам разные (day_idx, chunk_idx) пишут в один
+    // day_dir одновременно, и общий счётчик shard_id больше не подходит.
     let stat_path = out_dir
         .join(&day_str)
-        .join(format!("stats_shard{:03}.json", shard_id));
+        .join(format!("stats_shard_d{:03}_c{:05}.json", day_idx, chunk_idx));
     let stats_json = serde_json::to_string_pretty(&stats)?;
     std::fs::write(stat_path, stats_json)?;
 

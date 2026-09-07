@@ -162,6 +162,28 @@ impl SubscriberDbRedb {
         Ok(table.len()? as usize)
     }
 
+    /// Реальные MSISDN абонентов, как они лежат в базе, в порядке ключей
+    /// (redb хранит SNAPSHOTS как B-дерево — итерация уже отсортирована).
+    ///
+    /// Этап 3 (docs/field-mapping.md, «Найденный попутно дефект»): раньше
+    /// генератор CDR вычислял ожидаемый MSISDN арифметически из индекса
+    /// абонента и почти никогда не находил его в базе, потому что
+    /// generate-subscribers присваивает MSISDN случайно. Правильная выборка —
+    /// читать ключи как они есть, без арифметики. Читаем только ключи
+    /// (без bincode-десериализации значений) — дёшево даже на больших базах.
+    pub fn list_all_msisdns(&self) -> Result<Vec<u64>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SNAPSHOTS)?;
+
+        let mut result = Vec::with_capacity(table.len()? as usize);
+        for entry in table.iter()? {
+            let (msisdn, _) = entry?;
+            result.push(msisdn.value());
+        }
+
+        Ok(result)
+    }
+
     /// Find snapshot valid at a given timestamp from a pre-loaded list
     /// This is much faster than get_subscriber_at() for repeated lookups
     /// Returns None if no valid snapshot found at that timestamp

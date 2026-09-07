@@ -14,12 +14,12 @@
 
 use chrono::{Datelike, Duration, TimeZone};
 use clap::{Parser, Subcommand};
-use crossbeam_channel::unbounded;
+use crossbeam_channel::bounded;
 use rayon::prelude::*;
 use rs_cdr_generator::async_writer::{writer_task, WriterMessage};
 use rs_cdr_generator::cells::{ensure_cells_catalog, load_cells_catalog};
 use rs_cdr_generator::config::{load_config, parse_prefixes, Config};
-use rs_cdr_generator::generators::worker_generate;
+use rs_cdr_generator::generators::worker_generate_shard;
 use rs_cdr_generator::subscriber_db_generator::{generate_database_redb, GeneratorConfig};
 use rs_cdr_generator::subscriber_db_redb::SubscriberDbRedb;
 use rs_cdr_generator::timezone_utils::tz_from_name;
@@ -391,12 +391,20 @@ fn handle_generate_cdr(
     // Open redb database (will be shared across all workers)
     println!("Loading subscriber database: {:?}", subscriber_db);
     let redb = SubscriberDbRedb::open(&subscriber_db)?;
-    let subs = redb.count_msisdns()?;
+    // Этап 3: реальные MSISDN абонентов, как они лежат в базе — не
+    // арифметика по индексу (docs/field-mapping.md, «Найденный попутно
+    // дефект»). Общий на весь прогон и на всех воркеров сразу (этап 4,
+    // требование 2) — оборачиваем в Arc и раздаём каждому work item целиком,
+    // а не своим куском: собеседник звонка выбирается из ВСЕГО пула.
+    let all_msisdns = Arc::new(redb.list_all_msisdns()?);
+    let subs = all_msisdns.len();
     println!("Loaded {} subscribers from database\n", subs);
 
     let redb_arc = Arc::new(redb);
 
-    // Generate data for each day
+    // Дни и день-каталоги готовим заранее — воркеры разных дней теперь
+    // работают одновременно (этап 4), а не по очереди.
+    let mut days_vec = Vec::with_capacity(days);
     for d in 0..days {
         let day_naive = start_date + Duration::days(d as i64);
         let day = tz
@@ -409,107 +417,162 @@ fn handle_generate_cdr(
                 0,
             )
             .unwrap();
-
         let day_str = day.format("%Y-%m-%d").to_string();
-        let day_dir = out.join(&day_str);
-        std::fs::create_dir_all(&day_dir)?;
-        // Формат имени файла CDR_{ne_id}_{date}.csv.gz — дата в формате YYYYMMDD,
-        // как в питоновском эталоне (writer/csv_writer.py, _resolve_path).
-        let date_compact = day.format("%Y%m%d").to_string();
-
-        // Split users uniformly across workers
-        let w = cfg.workers;
-        let shard_size = subs / w;
-
-        let mut ranges = Vec::new();
-        let mut s = 0;
-        for i in 0..w {
-            let e = if i < w - 1 { s + shard_size } else { subs };
-            ranges.push((s, e));
-            s = e;
-        }
-
-        // Create Tokio runtime for async writers
-        let rt = tokio::runtime::Runtime::new()?;
-
-        // Determine number of writer tasks (default: workers / 2)
-        let writer_tasks = if cfg.writer_tasks > 0 {
-            cfg.writer_tasks
-        } else {
-            (w / 2).max(1)
-        };
-
-        // 🔴 Партиционирование вывода сейчас — по (ne_id, дата) внутри КАЖДОЙ
-        // writer-задачи независимо (writer.rs), а маршрутизация событий
-        // к задачам — round-robin по индексу воркера (ниже), не по ne_id.
-        // При writer_tasks > 1 разные задачи могут независимо открыть и
-        // перезаписать один и тот же файл CDR_{ne_id}_{date}.csv.gz —
-        // тихая порча данных. Чинится маршрутизацией по ne_id, то есть
-        // правкой архитектуры параллелизма — сознательно не в этом этапе
-        // (docs/field-mapping.md). Поэтому здесь — жёсткий отказ, а не
-        // пометка в документации: тот, кто выставит writer_tasks > 1,
-        // должен получить понятную ошибку, а не битые файлы.
-        if writer_tasks > 1 {
-            anyhow::bail!(
-                "writer_tasks={} не поддерживается: несколько writer-задач могут одновременно \
-                писать в один файл CDR_{{ne_id}}_{{date}}.csv.gz, потому что маршрутизация \
-                событий к задачам сейчас идёт по воркеру, а не по ne_id. Запускайте с \
-                writer_tasks=1, пока маршрутизация по ne_id не реализована (следующий этап).",
-                writer_tasks
-            );
-        }
-
-        // Create channels and spawn async writer tasks
-        let mut writer_channels = Vec::new();
-        let mut writer_handles = Vec::new();
-
-        for shard_id in 0..writer_tasks {
-            let (tx, rx) = unbounded();
-            writer_channels.push(tx);
-
-            let out_dir = out.clone();
-            let date_compact_clone = date_compact.clone();
-
-            let handle = rt.spawn(async move {
-                writer_task(rx, out_dir, date_compact_clone, shard_id).await
-            });
-
-            writer_handles.push(handle);
-        }
-
-        // Run workers in parallel with writer channels
-        ranges
-            .par_iter()
-            .enumerate()
-            .try_for_each(|(i, &(lo, hi))| {
-                // Map worker to writer shard (round-robin)
-                let writer_idx = i % writer_tasks;
-                let writer_tx = writer_channels[writer_idx].clone();
-
-                worker_generate(day, i, (lo, hi), &cfg, &out, None, Some(&redb_arc), writer_tx)
-            })?;
-
-        // Send Close messages to all writers
-        for tx in writer_channels {
-            tx.send(WriterMessage::Close)?;
-        }
-
-        // Wait for all writer tasks to complete
-        for handle in writer_handles {
-            rt.block_on(handle)??;
-        }
-
-        // Статистика по шардам собирается как раньше (out/<day_str>/stats_shard*.json).
-        create_daily_summary(&out, &day)?;
-        // Раньше здесь был bundle_day — склейка шард-файлов в один архив дня.
-        // Больше не нужен: итоговые файлы уже в формате контура
-        // (out/<ne_id>/CDR_{ne_id}_{date}.csv.gz), один на (ne_id, дата),
-        // и являются готовой поставкой сами по себе — упаковывать их в
-        // ещё один архив незачем и ломало бы ожидаемое имя файла.
-        let _ = cleanup_after_archive;
-
-        println!("Day {} done → {:?}", day_str, out);
+        std::fs::create_dir_all(out.join(&day_str))?;
+        days_vec.push(day);
     }
+
+    // Этап 4: ось параллелизма — даты (и внутри дня — куски общего пула
+    // абонентов размером cfg.chunk_size, чтобы rayon было чем занять
+    // воркеры даже при одном-двух днях в прогоне — «или по парам
+    // элемент-сутки» из задания реализовано как «день × кусок пула»,
+    // так же однозначно закрепляющее файл (ne_id, дата) за воркерами,
+    // как и деление по элементам, но без завязки на их число).
+    // Было: внешний цикл по дням последовательный, rayon резал только
+    // абонентов внутри дня (main.rs, ранее ~строка 400).
+    let chunk_size = cfg.chunk_size.max(1);
+    let mut work_items: Vec<(usize, usize, (usize, usize))> = Vec::new();
+    // Сколько кусков пула приходится на каждый день — нужно, чтобы понять,
+    // когда день закрыт целиком (все его куски отправили свои пачки) и можно
+    // закрыть его файлы у writer-задач, не дожидаясь конца всего прогона.
+    let mut chunks_per_day: Vec<usize> = Vec::with_capacity(days);
+    for (day_idx, _) in days_vec.iter().enumerate() {
+        let mut chunk_idx = 0usize;
+        let mut s = 0usize;
+        while s < subs {
+            let e = (s + chunk_size).min(subs);
+            work_items.push((day_idx, chunk_idx, (s, e)));
+            s = e;
+            chunk_idx += 1;
+        }
+        if subs == 0 {
+            // Пустая база — всё равно один пустой work item, чтобы день
+            // получил свой (пустой) стат-файл и попал в дневную сводку.
+            work_items.push((day_idx, 0, (0, 0)));
+            chunk_idx = 1;
+        }
+        chunks_per_day.push(chunk_idx);
+    }
+    let date_compacts: Vec<String> = days_vec.iter().map(|d| d.format("%Y%m%d").to_string()).collect();
+    // 🔴 Источник роста пика RSS с числом дней в прогоне (проверено:
+    // --workers 2, 2 дня → 315 МБ, 8 дней → 919 МБ, 32 дня → 1236 МБ) — не
+    // число одновременно работающих воркеров (оно уже ограничено пулом
+    // rayon ниже), а то, что writer-задача, живущая весь прогон, держит
+    // открытыми файлы ВСЕХ дней сразу. `day_remaining` считает, сколько
+    // кусков дня ещё не отправили свои пачки; когда счётчик доходит до 0,
+    // всем writer-задачам уходит CloseDate — они закрывают файлы этой даты
+    // и больше не держат их открытыми до конца прогона.
+    let day_remaining: Vec<std::sync::atomic::AtomicUsize> = chunks_per_day
+        .iter()
+        .map(|&n| std::sync::atomic::AtomicUsize::new(n))
+        .collect();
+
+    // Determine number of writer tasks (default: workers / 2)
+    let w = cfg.workers;
+    let writer_tasks = if cfg.writer_tasks > 0 {
+        cfg.writer_tasks
+    } else {
+        (w / 2).max(1)
+    };
+
+    // Этап 5: writer-задачи живут ВЕСЬ прогон (не пересоздаются на каждый
+    // день, как было раньше) — события разных дней и разных work item'ов
+    // могут прийти в одну и ту же задачу, но каждую пару (ne_id, дата)
+    // маршрутизирует к задаче ровно один и тот же индекс (generators.rs,
+    // route_writer_idx), поэтому коллизии открытия файла нет и
+    // writer_tasks > 1 больше не запрещён.
+    let rt = tokio::runtime::Runtime::new()?;
+    let mut writer_channels = Vec::new();
+    let mut writer_handles = Vec::new();
+    // Канал ОГРАНИЧЕН, а не unbounded: этап 4 запустил work item'ы ВСЕХ дней
+    // сразу (rayon.par_iter по флоскому work_items), и без ограничения
+    // производители обгоняют writer-задачи — бэклог пачек в канале растёт
+    // пропорционально суммарному объёму сгенерированного, то есть пику RSS,
+    // растущему с числом дней (проверено прогоном: 2 дня → 351 МБ,
+    // 8 дней (4×) → 1671 МБ, почти линейно). Ограничение возвращает
+    // потоковую запись: производитель блокируется на send(), когда писатель
+    // отстаёт, и бэклог не может расти неограниченно.
+    for shard_id in 0..writer_tasks {
+        let (tx, rx) = bounded(64);
+        writer_channels.push(tx);
+        let out_dir = out.clone();
+        let handle = rt.spawn(async move { writer_task(rx, out_dir, shard_id).await });
+        writer_handles.push(handle);
+    }
+
+    // Run all (день, кусок пула) work items in parallel.
+    //
+    // 🔴 Пул rayon ограничен cfg.workers явно, а не глобальным дефолтом
+    // (= число ядер). Раньше в один момент времени работало ровно `w` задач
+    // (`ranges` — массив длины `w`, по одной на воркер, один день за раз);
+    // при плоском списке work_items (день × кусок пула) число элементов
+    // стало равно days × chunks_per_day, и глобальный пул rayon без
+    // ограничения планирует СТОЛЬКО задач параллельно, сколько ядер —
+    // это даёт пик RSS, растущий с числом дней (проверено прогоном: 2 дня →
+    // 354 МБ, 8 дней (4×) → 1710 МБ, почти линейно), даже после того как
+    // канал писателя стал ограниченным (bounded(64) выше не помог — узкое
+    // место было не в канале, а в числе одновременно работающих
+    // производителей). Явный лимит возвращает потоковую запись: параллельно
+    // всегда не больше `w` кусков, независимо от того, сколько дней в прогоне.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(cfg.workers)
+        .build()?;
+    pool.install(|| {
+        work_items.par_iter().try_for_each(|&(day_idx, chunk_idx, range)| {
+            worker_generate_shard(
+                days_vec[day_idx],
+                day_idx,
+                chunk_idx,
+                range,
+                &all_msisdns,
+                &cfg,
+                &out,
+                &redb_arc,
+                &writer_channels,
+                seed,
+            )?;
+
+            // Этот work item отправил все свои пачки — если это был
+            // последний непогашенный кусок дня, день закрыт целиком:
+            // рассылаем CloseDate, чтобы writer-задачи освободили файлы
+            // этой даты сразу, а не держали их до конца всего прогона.
+            let remaining = day_remaining[day_idx]
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            if remaining == 1 {
+                for tx in &writer_channels {
+                    tx.send(WriterMessage::CloseDate(date_compacts[day_idx].clone()))?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+    })?;
+
+    // Send Close messages to all writers
+    for tx in writer_channels {
+        tx.send(WriterMessage::Close)?;
+    }
+
+    // Wait for all writer tasks to complete
+    for handle in writer_handles {
+        rt.block_on(handle)??;
+    }
+
+    // Дневные сводки — все дни уже сгенерированы (стат-файлы лежат по
+    // out/<day_str>/stats_shard_d*_c*.json), считаем сводку по каждому дню.
+    for day in &days_vec {
+        create_daily_summary(&out, day)?;
+        println!(
+            "Day {} done → {:?}",
+            day.format("%Y-%m-%d"),
+            out
+        );
+    }
+    // Раньше здесь был bundle_day — склейка шард-файлов в один архив дня.
+    // Больше не нужен: итоговые файлы уже в формате контура
+    // (out/<ne_id>/CDR_{ne_id}_{date}.csv.gz), один на (ne_id, дата),
+    // и являются готовой поставкой сами по себе — упаковывать их в
+    // ещё один архив незачем и ломало бы ожидаемое имя файла.
+    let _ = cleanup_after_archive;
 
     println!("\n=== CDR Generation Complete ===");
 
