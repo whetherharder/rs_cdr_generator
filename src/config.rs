@@ -77,11 +77,17 @@ pub struct Config {
     pub validate_db_only: bool,
 
     // Сетевые элементы (MSC/SGW/PGW/SMSC), которыми партиционируется вывод.
-    // Флоский список — упрощение этапа 1 (docs/field-mapping.md, «serving_ne_id»):
-    // настоящей привязки соты к NE по TAC в rust нет, событие получает ne_id
-    // хешем по cell_id. Этап 2 заменит источник списка на network.elements[].id
-    // вложенного конфига контура, сам приём назначения не меняя.
+    // По умолчанию — флоский список-заглушка; при чтении вложенного
+    // network.elements контурного конфига (contour::ContourConfig,
+    // load_config) заменяется на реальные id (этап 2).
     pub network_elements: Vec<String>,
+
+    // Поля вложенного конфига контура (meta.seed, meta.time_range.*),
+    // прочитанные строго — см. contour.rs. Отсутствуют (None), если
+    // --config не вложенный конфиг контура, а старый плоский.
+    pub contour_seed: Option<u64>,
+    pub contour_time_range_start: Option<String>,
+    pub contour_time_range_end: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +188,9 @@ impl Default for Config {
                 "sgw-01".to_string(),
                 "pgw-01".to_string(),
             ],
+            contour_seed: None,
+            contour_time_range_start: None,
+            contour_time_range_end: None,
         }
     }
 }
@@ -222,7 +231,20 @@ pub fn load_config(config_path: Option<&Path>) -> anyhow::Result<Config> {
             let contents = std::fs::read_to_string(path)?;
             let user_config: serde_yaml::Value = serde_yaml::from_str(&contents)?;
 
-            // Merge user config with defaults
+            // Вложенный конфиг контура (meta.*, network.*, subscribers.*) —
+            // как в demo-cdr.yaml. Если секции meta/network/subscribers
+            // присутствуют, но внутри незнакомый ключ или не тот тип —
+            // это ошибка конфига, и мы падаем (contour.rs, deny_unknown_fields),
+            // а не проглатываем её молча старым плоским мерджем ниже.
+            if let Some(parsed) = crate::contour::try_parse_contour_config(&user_config) {
+                let contour = parsed?;
+                apply_contour_config(&mut config, &contour);
+            }
+
+            // Старый плоский формат ключей (rotate_bytes, workers, ...) —
+            // читается тем же проходом; для вложенного конфига контура
+            // эти ключи обычно отсутствуют на верхнем уровне, но если
+            // есть (например, при постепенном переходе) — тоже применяются.
             if let serde_yaml::Value::Mapping(map) = user_config {
                 for (key, value) in map {
                     if let serde_yaml::Value::String(key_str) = key {
@@ -234,6 +256,21 @@ pub fn load_config(config_path: Option<&Path>) -> anyhow::Result<Config> {
     }
 
     Ok(config)
+}
+
+/// Переносит прочитанные вложенные секции контура в плоский Config,
+/// которым пользуется остальной rust-код (generators.rs, main.rs).
+fn apply_contour_config(config: &mut Config, contour: &crate::contour::ContourConfig) {
+    config.contour_seed = Some(contour.meta.seed);
+    config.contour_time_range_start = Some(contour.meta.time_range.start.clone());
+    config.contour_time_range_end = Some(contour.meta.time_range.end.clone());
+
+    config.subscribers = contour.subscribers.total_count;
+
+    let ids: Vec<String> = contour.network.elements.iter().map(|e| e.id.clone()).collect();
+    if !ids.is_empty() {
+        config.network_elements = ids;
+    }
 }
 
 fn merge_config_value(config: &mut Config, key: &str, value: serde_yaml::Value) {

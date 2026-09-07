@@ -3,6 +3,7 @@ pub mod async_writer;
 pub mod cells;
 pub mod compression;
 pub mod config;
+pub mod contour;
 pub mod event_pool;
 pub mod generators;
 pub mod identity;

@@ -301,6 +301,21 @@ fn handle_generate_cdr(
         Config::default()
     };
 
+    // Контрольный вывод прочитанных значений вложенного конфига контура —
+    // критерий готовности этапа 2 (docs/field-mapping.md): показать
+    // разобранные значения выводом программы, а не рассуждением.
+    if cfg.contour_seed.is_some() || cfg.contour_time_range_start.is_some() {
+        println!("Конфиг контура прочитан:");
+        println!("  meta.seed = {:?}", cfg.contour_seed);
+        println!(
+            "  meta.time_range = {:?} .. {:?}",
+            cfg.contour_time_range_start, cfg.contour_time_range_end
+        );
+        println!("  subscribers.total_count = {}", cfg.subscribers);
+        println!("  network.elements (id) = {:?}", cfg.network_elements);
+        println!();
+    }
+
     // Set subscriber database path
     cfg.subscriber_db_redb_path = Some(subscriber_db.clone());
 
