@@ -23,7 +23,7 @@ use rs_cdr_generator::generators::worker_generate;
 use rs_cdr_generator::subscriber_db_generator::{generate_database_redb, GeneratorConfig};
 use rs_cdr_generator::subscriber_db_redb::SubscriberDbRedb;
 use rs_cdr_generator::timezone_utils::tz_from_name;
-use rs_cdr_generator::utils::{bundle_day, create_daily_summary};
+use rs_cdr_generator::utils::create_daily_summary;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -398,6 +398,9 @@ fn handle_generate_cdr(
         let day_str = day.format("%Y-%m-%d").to_string();
         let day_dir = out.join(&day_str);
         std::fs::create_dir_all(&day_dir)?;
+        // Формат имени файла CDR_{ne_id}_{date}.csv.gz — дата в формате YYYYMMDD,
+        // как в питоновском эталоне (writer/csv_writer.py, _resolve_path).
+        let date_compact = day.format("%Y%m%d").to_string();
 
         // Split users uniformly across workers
         let w = cfg.workers;
@@ -421,6 +424,26 @@ fn handle_generate_cdr(
             (w / 2).max(1)
         };
 
+        // 🔴 Партиционирование вывода сейчас — по (ne_id, дата) внутри КАЖДОЙ
+        // writer-задачи независимо (writer.rs), а маршрутизация событий
+        // к задачам — round-robin по индексу воркера (ниже), не по ne_id.
+        // При writer_tasks > 1 разные задачи могут независимо открыть и
+        // перезаписать один и тот же файл CDR_{ne_id}_{date}.csv.gz —
+        // тихая порча данных. Чинится маршрутизацией по ne_id, то есть
+        // правкой архитектуры параллелизма — сознательно не в этом этапе
+        // (docs/field-mapping.md). Поэтому здесь — жёсткий отказ, а не
+        // пометка в документации: тот, кто выставит writer_tasks > 1,
+        // должен получить понятную ошибку, а не битые файлы.
+        if writer_tasks > 1 {
+            anyhow::bail!(
+                "writer_tasks={} не поддерживается: несколько writer-задач могут одновременно \
+                писать в один файл CDR_{{ne_id}}_{{date}}.csv.gz, потому что маршрутизация \
+                событий к задачам сейчас идёт по воркеру, а не по ne_id. Запускайте с \
+                writer_tasks=1, пока маршрутизация по ne_id не реализована (следующий этап).",
+                writer_tasks
+            );
+        }
+
         // Create channels and spawn async writer tasks
         let mut writer_channels = Vec::new();
         let mut writer_handles = Vec::new();
@@ -430,21 +453,10 @@ fn handle_generate_cdr(
             writer_channels.push(tx);
 
             let out_dir = out.clone();
-            let day_str_clone = day_str.clone();
-            let rotate_bytes = cfg.rotate_bytes;
-            let compression_type = rs_cdr_generator::compression::CompressionType::from_str(&cfg.compression_type)
-                .unwrap_or(rs_cdr_generator::compression::CompressionType::Gzip);
+            let date_compact_clone = date_compact.clone();
 
             let handle = rt.spawn(async move {
-                writer_task(
-                    rx,
-                    out_dir,
-                    day_str_clone,
-                    shard_id,
-                    rotate_bytes,
-                    compression_type,
-                )
-                .await
+                writer_task(rx, out_dir, date_compact_clone, shard_id).await
             });
 
             writer_handles.push(handle);
@@ -472,14 +484,16 @@ fn handle_generate_cdr(
             rt.block_on(handle)??;
         }
 
-        // Create summary and bundle
+        // Статистика по шардам собирается как раньше (out/<day_str>/stats_shard*.json).
         create_daily_summary(&out, &day)?;
-        let compression_ext = rs_cdr_generator::compression::CompressionType::from_str(&cfg.compression_type)
-            .unwrap_or(rs_cdr_generator::compression::CompressionType::Gzip)
-            .extension();
-        let tarfile_path = bundle_day(&out, &day, cleanup_after_archive, compression_ext)?;
+        // Раньше здесь был bundle_day — склейка шард-файлов в один архив дня.
+        // Больше не нужен: итоговые файлы уже в формате контура
+        // (out/<ne_id>/CDR_{ne_id}_{date}.csv.gz), один на (ne_id, дата),
+        // и являются готовой поставкой сами по себе — упаковывать их в
+        // ещё один архив незачем и ломало бы ожидаемое имя файла.
+        let _ = cleanup_after_archive;
 
-        println!("Day {} done → {:?}", day_str, tarfile_path);
+        println!("Day {} done → {:?}", day_str, out);
     }
 
     println!("\n=== CDR Generation Complete ===");

@@ -72,12 +72,12 @@ mod tests {
 
         // Acquire first event
         let event1 = pool.acquire();
-        event1.msisdn_src = 123456;
+        event1.calling_number = "123456".to_string();
         assert_eq!(pool.stats().current_index, 1);
 
         // Acquire second event
         let event2 = pool.acquire();
-        event2.msisdn_src = 789012;
+        event2.calling_number = "789012".to_string();
         assert_eq!(pool.stats().current_index, 2);
     }
 
@@ -88,7 +88,7 @@ mod tests {
         // Acquire 4 events - should wrap around
         for i in 0..4 {
             let event = pool.acquire();
-            event.msisdn_src = i as u64;
+            event.calling_number = i.to_string();
         }
 
         // After 4 acquisitions with capacity 3, index should be 1 (4 % 3)
@@ -100,16 +100,16 @@ mod tests {
         let mut pool = EventPool::new(10);
 
         let event = pool.acquire();
-        event.msisdn_src = 999999;
-        event.event_type = "CALL";
+        event.calling_number = "999999".to_string();
+        event.record_type = "mo_call".to_string();
 
         // Acquire again - should be reset
         let event2 = pool.acquire();
-        event2.msisdn_src = 111111;
+        event2.calling_number = "111111".to_string();
 
         // Next acquisition should give us a reset event
         let event3 = pool.acquire();
-        // Values should be default (0 for numbers, "" for strings)
-        assert_eq!(event3.msisdn_dst, 0);
+        // Values should be default ("" for strings)
+        assert_eq!(event3.called_number, "");
     }
 }

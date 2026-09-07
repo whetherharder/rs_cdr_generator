@@ -75,6 +75,13 @@ pub struct Config {
     pub db_number_release_rate: f64,
     pub db_cooldown_days: usize,
     pub validate_db_only: bool,
+
+    // Сетевые элементы (MSC/SGW/PGW/SMSC), которыми партиционируется вывод.
+    // Флоский список — упрощение этапа 1 (docs/field-mapping.md, «serving_ne_id»):
+    // настоящей привязки соты к NE по TAC в rust нет, событие получает ne_id
+    // хешем по cell_id. Этап 2 заменит источник списка на network.elements[].id
+    // вложенного конфига контура, сам приём назначения не меняя.
+    pub network_elements: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +175,13 @@ impl Default for Config {
             db_number_release_rate: 0.05,
             db_cooldown_days: 90,
             validate_db_only: false,
+            network_elements: vec![
+                "msc-01".to_string(),
+                "msc-02".to_string(),
+                "smsc-01".to_string(),
+                "sgw-01".to_string(),
+                "pgw-01".to_string(),
+            ],
         }
     }
 }
@@ -358,6 +372,17 @@ fn merge_config_value(config: &mut Config, key: &str, value: serde_yaml::Value) 
         "subscriber_db_redb_path" => {
             if let Some(v) = value.as_str() {
                 config.subscriber_db_redb_path = Some(PathBuf::from(v));
+            }
+        }
+        "network_elements" => {
+            if let Some(arr) = value.as_sequence() {
+                let ids: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                if !ids.is_empty() {
+                    config.network_elements = ids;
+                }
             }
         }
         _ => {}

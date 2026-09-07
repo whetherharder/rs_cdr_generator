@@ -18,6 +18,55 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Отдаёт serving_ne_id для АБОНЕНТА (не для соты и не для события).
+///
+/// В питоне serving_ne_id — поле модели абонента (assets/models.py:38-47),
+/// присваивается один раз при генерации состава через tac_to_ne, и все
+/// события абонента идут через его элемент. В rust нет топологии (TAC),
+/// заводить её в эту порцию не должны — поэтому распределяем абонентов
+/// по списку network_elements детерминированным хешем их MSISDN, а не
+/// от соты события: тот же абонент при том же конфиге ВСЕГДА попадает
+/// в один и тот же NE, независимо от того, в какой соте его застало
+/// конкретное событие. Это и есть содержательный инвариант, который важен
+/// для партиций (docs/field-mapping.md, «serving_ne_id»).
+///
+/// Сознательно не персистентное поле redb-базы абонентов (в отличие от
+/// питона): функция чистая от msisdn, поэтому переигрывается одинаково
+/// при каждом запуске без миграции схемы базы. Наблюдаемое поведение то
+/// же самое — абонент стабильно закреплён за одним NE.
+fn assign_ne_id(msisdn: u64, network_elements: &[String]) -> String {
+    if network_elements.is_empty() {
+        return "unknown-ne".to_string();
+    }
+    let idx = (msisdn as usize) % network_elements.len();
+    network_elements[idx].clone()
+}
+
+/// event_type("CALL"/"SMS"/"DATA") + direction("MO"/"MT") + для DATA — сторона
+/// пары (sgw/pgw) → record_type CDR_FIELDS питоновского эталона
+/// (mo_call/mt_call/mo_sms/mt_sms/sgw_data/pgw_data). Rust не порождает
+/// SGW+PGW пару на одну data-сессию (models/cdr.py, data.py:
+/// _create_sgw_pgw_pair) — эмитим один pgw_data-эквивалент, это тоже
+/// зафиксировано как упрощение этапа 1 в docs/field-mapping.md.
+fn cdr_record_type(event_type: &str, direction: &str) -> &'static str {
+    match (event_type, direction) {
+        ("CALL", "MO") => "mo_call",
+        ("CALL", _) => "mt_call",
+        ("SMS", "MO") => "mo_sms",
+        ("SMS", _) => "mt_sms",
+        ("DATA", _) => "pgw_data",
+        _ => "",
+    }
+}
+
+/// ISO-8601 с миллисекундами и суффиксом Z — тот же формат, что питоновский
+/// _fmt_dt в models/cdr.py (isoformat(timespec="milliseconds") + "Z").
+fn fmt_ts_ms(epoch_ms: i64) -> String {
+    use chrono::TimeZone;
+    let dt = chrono::Utc.timestamp_millis_opt(epoch_ms).single().expect("epoch_ms всегда валиден");
+    dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
 /// Calculate lognormal mu and sigma from quantiles
 pub fn lognorm_params_from_quantiles(p50: f64, p90: f64) -> (f64, f64) {
     let mu = p50.max(1.0).ln();
@@ -118,6 +167,7 @@ pub struct CallGenerator {
     mu: f64,
     sigma: f64,
     duration_dist: LogNormal<f64>,  // Pre-computed distribution (OPTIMIZATION #4)
+    network_elements: Vec<String>,
 }
 
 impl CallGenerator {
@@ -147,6 +197,7 @@ impl CallGenerator {
             mu,
             sigma,
             duration_dist,
+            network_elements: cfg.network_elements.clone(),
         }
     }
 
@@ -197,23 +248,27 @@ impl CallGenerator {
         };
 
         let end_local = start_local + Duration::seconds(dur_sec);
+        let ne_id = assign_ne_id(sub.msisdn, &self.network_elements);
 
-        event.event_type = "CALL";
-        event.msisdn_src = msisdn_src;
-        event.msisdn_dst = msisdn_dst;
-        event.direction = direction;
-        event.start_ts_ms = to_epoch_ms(&start_local.with_timezone(&chrono::Utc));
-        event.end_ts_ms = to_epoch_ms(&end_local.with_timezone(&chrono::Utc));
-        event.tz_name = tz_name;
-        event.tz_offset_min = tz_offset_minutes(&start_local);
-        event.duration_sec = dur_sec;
-        event.mccmnc = sub.mccmnc;
-        event.imsi = sub.imsi;
-        event.imei = sub.imei;
-        event.cell_id = cell_id;
-        event.record_type = "mscVoiceRecord";
-        event.cause_for_record_closing = cause;
-        // Leave other fields at default (reset by pool)
+        event.record_type = cdr_record_type("CALL", direction).to_string();
+        event.served_imsi = sub.imsi.to_string();
+        event.served_msisdn = sub.msisdn.to_string();
+        event.served_imei = sub.imei.to_string();
+        event.calling_number = msisdn_src.to_string();
+        event.called_number = msisdn_dst.to_string();
+        event.event_timestamp = fmt_ts_ms(to_epoch_ms(&start_local.with_timezone(&chrono::Utc)));
+        event.release_timestamp = fmt_ts_ms(to_epoch_ms(&end_local.with_timezone(&chrono::Utc)));
+        event.duration_seconds = dur_sec.to_string();
+        event.first_cell_id = cell_id.to_string();
+        event.last_cell_id = cell_id.to_string();
+        event.serving_ne_id = ne_id;
+        // cause_for_termination: у питона это числовой код (voice.py normal_termination_causes),
+        // в rust — только текстовая причина (cause_for_record_closing); числовой код не заводим,
+        // чтобы не изобретать соответствие — оставляем пустым (docs/field-mapping.md).
+        let _ = cause;
+        // Остальные поля (answer_timestamp, apn, qci, rat_type, vendor_extensions,
+        // sequence_number, consolidation_id, charging_id, record_opening/closure_time,
+        // uplink/downlink_volume_bytes) — пустые (сброшены пулом), см. docs/field-mapping.md.
     }
 
     /// Generate call event with forced direction (for MO↔MT correlation)
@@ -262,23 +317,21 @@ impl CallGenerator {
         };
 
         let end_local = start_local + Duration::seconds(dur_sec);
+        let ne_id = assign_ne_id(sub.msisdn, &self.network_elements);
 
-        event.event_type = "CALL";
-        event.msisdn_src = msisdn_src;
-        event.msisdn_dst = msisdn_dst;
-        event.direction = direction;
-        event.start_ts_ms = to_epoch_ms(&start_local.with_timezone(&chrono::Utc));
-        event.end_ts_ms = to_epoch_ms(&end_local.with_timezone(&chrono::Utc));
-        event.tz_name = tz_name;
-        event.tz_offset_min = tz_offset_minutes(&start_local);
-        event.duration_sec = dur_sec;
-        event.mccmnc = sub.mccmnc;
-        event.imsi = sub.imsi;
-        event.imei = sub.imei;
-        event.cell_id = cell_id;
-        event.record_type = "mscVoiceRecord";
-        event.cause_for_record_closing = cause;
-        // Leave other fields at default (reset by pool)
+        event.record_type = cdr_record_type("CALL", direction).to_string();
+        event.served_imsi = sub.imsi.to_string();
+        event.served_msisdn = sub.msisdn.to_string();
+        event.served_imei = sub.imei.to_string();
+        event.calling_number = msisdn_src.to_string();
+        event.called_number = msisdn_dst.to_string();
+        event.event_timestamp = fmt_ts_ms(to_epoch_ms(&start_local.with_timezone(&chrono::Utc)));
+        event.release_timestamp = fmt_ts_ms(to_epoch_ms(&end_local.with_timezone(&chrono::Utc)));
+        event.duration_seconds = dur_sec.to_string();
+        event.first_cell_id = cell_id.to_string();
+        event.last_cell_id = cell_id.to_string();
+        event.serving_ne_id = ne_id;
+        let _ = cause; // числовой cause_for_termination не заводим — docs/field-mapping.md
     }
 }
 
@@ -287,6 +340,7 @@ pub struct SmsGenerator {
     p_mo: f64,
     status_dist: WeightedIndex<f64>,
     segments_dist: WeightedIndex<f64>,
+    network_elements: Vec<String>,
 }
 
 impl SmsGenerator {
@@ -301,6 +355,7 @@ impl SmsGenerator {
             p_mo: cfg.mo_share_sms,
             status_dist,
             segments_dist,
+            network_elements: cfg.network_elements.clone(),
         }
     }
 
@@ -347,24 +402,20 @@ impl SmsGenerator {
             _ => 3,
         };
 
-        event.event_type = "SMS";
-        event.msisdn_src = msisdn_src;
-        event.msisdn_dst = msisdn_dst;
-        event.direction = direction;
-        event.start_ts_ms = to_epoch_ms(&start_local.with_timezone(&chrono::Utc));
-        event.end_ts_ms = to_epoch_ms(&end_local.with_timezone(&chrono::Utc));
-        event.tz_name = tz_name;
-        event.tz_offset_min = tz_offset_minutes(&start_local);
-        event.duration_sec = dur;
-        event.mccmnc = sub.mccmnc;
-        event.imsi = sub.imsi;
-        event.imei = sub.imei;
-        event.cell_id = cell_id;
-        event.record_type = record_type;
-        event.cause_for_record_closing = cause;
-        event.sms_segments = sms_segments;
-        event.sms_status = sms_status;
-        // Leave data fields at default (reset by pool)
+        let ne_id = assign_ne_id(sub.msisdn, &self.network_elements);
+        let _ = record_type; // используем cdr_record_type ниже — своё имя записи rust не совпадает с питоном
+        event.record_type = cdr_record_type("SMS", direction).to_string();
+        event.served_imsi = sub.imsi.to_string();
+        event.served_msisdn = sub.msisdn.to_string();
+        event.served_imei = sub.imei.to_string();
+        event.calling_number = msisdn_src.to_string();
+        event.called_number = msisdn_dst.to_string();
+        event.event_timestamp = fmt_ts_ms(to_epoch_ms(&start_local.with_timezone(&chrono::Utc)));
+        event.duration_seconds = dur.to_string();
+        event.first_cell_id = cell_id.to_string();
+        event.last_cell_id = cell_id.to_string();
+        event.serving_ne_id = ne_id;
+        let _ = (cause, sms_segments, sms_status); // деталей SMS в CDR_FIELDS нет — docs/field-mapping.md
     }
 }
 
@@ -374,10 +425,11 @@ pub struct DataGenerator {
     cells_all: Vec<u32>,
     rat_dist: WeightedIndex<f64>,
     apn_dist: WeightedIndex<f64>,
+    network_elements: Vec<String>,
 }
 
 impl DataGenerator {
-    pub fn new(cells_by_rat: HashMap<String, Vec<u32>>, cells_all: Vec<u32>) -> Self {
+    pub fn new(cells_by_rat: HashMap<String, Vec<u32>>, cells_all: Vec<u32>, network_elements: Vec<String>) -> Self {
         let rat_weights = [0.3, 0.5, 0.2];
         let rat_dist = WeightedIndex::new(&rat_weights).unwrap();
 
@@ -389,6 +441,7 @@ impl DataGenerator {
             cells_all,
             rat_dist,
             apn_dist,
+            network_elements,
         }
     }
 
@@ -434,30 +487,32 @@ impl DataGenerator {
             rng.gen_range(10_000..100_000)
         };
 
-        let record_types = ["sgsnPDPRecord", "pgwRecord"];
-        let record_type = record_types[rng.gen_range(0..record_types.len())];
+        let _ = tz_name;
+        let ne_id = assign_ne_id(sub.msisdn, &self.network_elements);
+        let event_ts = fmt_ts_ms(to_epoch_ms(&start_local.with_timezone(&chrono::Utc)));
+        let closure_ts = fmt_ts_ms(to_epoch_ms(&end_local.with_timezone(&chrono::Utc)));
 
-        event.event_type = "DATA";
-        event.msisdn_src = sub.msisdn;
-        event.msisdn_dst = 0;
-        event.direction = "MO";
-        event.start_ts_ms = to_epoch_ms(&start_local.with_timezone(&chrono::Utc));
-        event.end_ts_ms = to_epoch_ms(&end_local.with_timezone(&chrono::Utc));
-        event.tz_name = tz_name;
-        event.tz_offset_min = tz_offset_minutes(&start_local);
-        event.duration_sec = dur;
-        event.mccmnc = sub.mccmnc;
-        event.imsi = sub.imsi;
-        event.imei = sub.imei;
-        event.cell_id = cell_id;
-        event.record_type = record_type;
-        event.cause_for_record_closing = "normalRelease";
-        event.data_bytes_in = up;
-        event.data_bytes_out = down;
-        event.data_duration_sec = dur;
-        event.apn = apn;
-        event.rat = rat;
-        // Leave SMS fields at default (reset by pool)
+        // Rust не порождает пару SGW+PGW на сессию (в отличие от data.py,
+        // _create_sgw_pgw_pair) — один record_type "pgw_data" на сессию,
+        // объёмы полностью на этой стороне (docs/field-mapping.md).
+        event.record_type = cdr_record_type("DATA", "MO").to_string();
+        event.served_imsi = sub.imsi.to_string();
+        event.served_msisdn = sub.msisdn.to_string();
+        event.served_imei = sub.imei.to_string();
+        event.calling_number = sub.msisdn.to_string();
+        event.event_timestamp = event_ts.clone();
+        event.duration_seconds = dur.to_string();
+        event.first_cell_id = cell_id.to_string();
+        event.last_cell_id = cell_id.to_string();
+        event.serving_ne_id = ne_id;
+        event.record_opening_time = event_ts;
+        event.record_closure_time = closure_ts;
+        // uplink = данные ОТ абонента (up), downlink = данные К абоненту (down) —
+        // как volume_uplink/volume_downlink питоновского generators/data.py.
+        event.uplink_volume_bytes = up.to_string();
+        event.downlink_volume_bytes = down.to_string();
+        event.apn = apn.to_string();
+        event.rat_type = rat.to_string();
     }
 }
 
@@ -575,7 +630,7 @@ pub fn worker_generate(
     // Initialize generators
     let call_gen = CallGenerator::new(cfg);
     let sms_gen = SmsGenerator::new(cfg);
-    let data_gen = DataGenerator::new(HashMap::new(), vec![]);
+    let data_gen = DataGenerator::new(HashMap::new(), vec![], cfg.network_elements.clone());
 
     let day_str = day.format("%Y-%m-%d").to_string();
 
@@ -682,31 +737,26 @@ pub fn worker_generate(
                 }
 
                 // Save call parameters from MO event for MT correlation (before borrowing event_pool again)
-                let start_ts = mo_event.start_ts_ms;
-                let end_ts = mo_event.end_ts_ms;
-                let tz_offset = mo_event.tz_offset_min;
-                let duration = mo_event.duration_sec;
-                let cause = mo_event.cause_for_record_closing;
+                let event_timestamp = mo_event.event_timestamp.clone();
+                let release_timestamp = mo_event.release_timestamp.clone();
+                let duration_seconds = mo_event.duration_seconds.clone();
 
                 // Generate MT record with same call parameters (time, duration, disposition)
                 let mt_event = event_pool.acquire();
 
                 // Copy call parameters from MO event for correlation
-                mt_event.event_type = "CALL";
-                mt_event.msisdn_src = other_msisdn;
-                mt_event.msisdn_dst = sub.msisdn;
-                mt_event.direction = "MT";
-                mt_event.start_ts_ms = start_ts;
-                mt_event.end_ts_ms = end_ts;
-                mt_event.tz_name = tz_name;
-                mt_event.tz_offset_min = tz_offset;
-                mt_event.duration_sec = duration;
-                mt_event.mccmnc = other_sub.mccmnc;
-                mt_event.imsi = other_sub.imsi;
-                mt_event.imei = other_sub.imei;
-                mt_event.cell_id = cell_id;
-                mt_event.record_type = "mscVoiceRecord";
-                mt_event.cause_for_record_closing = cause;
+                mt_event.record_type = cdr_record_type("CALL", "MT").to_string();
+                mt_event.served_imsi = other_sub.imsi.to_string();
+                mt_event.served_msisdn = other_sub.msisdn.to_string();
+                mt_event.served_imei = other_sub.imei.to_string();
+                mt_event.calling_number = other_msisdn.to_string();
+                mt_event.called_number = sub.msisdn.to_string();
+                mt_event.event_timestamp = event_timestamp;
+                mt_event.release_timestamp = release_timestamp;
+                mt_event.duration_seconds = duration_seconds;
+                mt_event.first_cell_id = cell_id.to_string();
+                mt_event.last_cell_id = cell_id.to_string();
+                mt_event.serving_ne_id = assign_ne_id(other_sub.msisdn, &cfg.network_elements);
 
                 // Add MT record to batch
                 batch.push(mt_event.clone());
@@ -824,7 +874,7 @@ fn worker_generate_redb_chunked(
     // Initialize generators
     let call_gen = CallGenerator::new(cfg);
     let sms_gen = SmsGenerator::new(cfg);
-    let data_gen = DataGenerator::new(HashMap::new(), vec![]);
+    let data_gen = DataGenerator::new(HashMap::new(), vec![], cfg.network_elements.clone());
 
     let day_str = day.format("%Y-%m-%d").to_string();
 
@@ -1006,29 +1056,24 @@ fn worker_generate_redb_chunked(
                     }
 
                     // Save parameters for MT correlation
-                    let start_ts = mo_event.start_ts_ms;
-                    let end_ts = mo_event.end_ts_ms;
-                    let tz_offset = mo_event.tz_offset_min;
-                    let duration = mo_event.duration_sec;
-                    let cause = mo_event.cause_for_record_closing;
+                    let event_timestamp = mo_event.event_timestamp.clone();
+                    let release_timestamp = mo_event.release_timestamp.clone();
+                    let duration_seconds = mo_event.duration_seconds.clone();
 
                     // Generate correlated MT record
                     let mt_event = event_pool.acquire();
-                    mt_event.event_type = "CALL";
-                    mt_event.msisdn_src = other_msisdn;
-                    mt_event.msisdn_dst = sub.msisdn;
-                    mt_event.direction = "MT";
-                    mt_event.start_ts_ms = start_ts;
-                    mt_event.end_ts_ms = end_ts;
-                    mt_event.tz_name = tz_name;
-                    mt_event.tz_offset_min = tz_offset;
-                    mt_event.duration_sec = duration;
-                    mt_event.mccmnc = other_snapshot.mccmnc;
-                    mt_event.imsi = other_snapshot.imsi;
-                    mt_event.imei = other_snapshot.imei;
-                    mt_event.cell_id = cell_id;
-                    mt_event.record_type = "mscVoiceRecord";
-                    mt_event.cause_for_record_closing = cause;
+                    mt_event.record_type = cdr_record_type("CALL", "MT").to_string();
+                    mt_event.served_imsi = other_snapshot.imsi.to_string();
+                    mt_event.served_msisdn = other_snapshot.msisdn.to_string();
+                    mt_event.served_imei = other_snapshot.imei.to_string();
+                    mt_event.calling_number = other_msisdn.to_string();
+                    mt_event.called_number = sub.msisdn.to_string();
+                    mt_event.event_timestamp = event_timestamp;
+                    mt_event.release_timestamp = release_timestamp;
+                    mt_event.duration_seconds = duration_seconds;
+                    mt_event.first_cell_id = cell_id.to_string();
+                    mt_event.last_cell_id = cell_id.to_string();
+                    mt_event.serving_ne_id = assign_ne_id(other_snapshot.msisdn, &cfg.network_elements);
 
                     batch.push(mt_event.clone());
                     stats.calls += 1;
