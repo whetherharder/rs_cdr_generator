@@ -1,0 +1,7 @@
+# Офлайн-сборка для изолированного контура: crates.io недоступен, все
+# зависимости берутся из каталога vendor/ (см. README — как его собрать).
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

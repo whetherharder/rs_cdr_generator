@@ -1,7 +1,8 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock коммитится намеренно — в изолированном контуре нет crates.io,
+# и без зафиксированных версий сборка невоспроизводима.
 
 # Output
 out/
@@ -23,6 +24,11 @@ Thumbs.db
 # Temporary
 tmp/
 temp/
+
+# Вендор-каталог офлайн-сборки (Dockerfile, cargo vendor) — не коммитим,
+# ~140 МБ чужого кода без диффа; генерируется командой из README перед
+# сборкой образа для изолированного контура.
+/vendor/
 
 # Benchmarking and profiling results
 benchmark_results/
