@@ -407,7 +407,18 @@ fn handle_generate_cdr(
     // независимость от периода дат и числа воркеров). Seed книги — свой,
     // не завязанный на day_idx/chunk_idx, которые определяют seed события.
     let book_seed = seed.wrapping_add(0x636f6e74616374); // "contact" в hex, чтобы не совпасть с seed событий
-    let contact_book = Arc::new(rs_cdr_generator::contact_book::ContactBook::build(&all_msisdns, book_seed));
+    // Параметры Zipf — из subscribers.contact_book конфига, если он их
+    // задал (contour.rs), иначе прежние константы contact_book.rs.
+    let contact_book = Arc::new(match (
+        cfg.contact_book_zipf_a,
+        cfg.contact_book_min_degree,
+        cfg.contact_book_max_degree,
+    ) {
+        (Some(a), Some(min_d), Some(max_d)) => {
+            rs_cdr_generator::contact_book::ContactBook::build_with_params(&all_msisdns, book_seed, a, min_d, max_d)
+        }
+        _ => rs_cdr_generator::contact_book::ContactBook::build(&all_msisdns, book_seed),
+    });
     println!("Contact book built for {} subscribers\n", subs);
     if std::env::var("CB_DEBUG").is_ok() {
         let lens: Vec<usize> = all_msisdns.iter().map(|m| contact_book.contacts_of(*m).len()).collect();

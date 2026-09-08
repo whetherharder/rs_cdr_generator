@@ -353,7 +353,17 @@ pub struct SmsGenerator {
 
 impl SmsGenerator {
     pub fn new(cfg: &Config) -> Self {
-        let status_weights = [0.1, 0.88, 0.02];
+        // events.sms.delivery_success_rate из конфига — доля DELIVERED;
+        // остаток делится между SENT/FAILED в прежней пропорции дефолта
+        // (0.1:0.02 = 5:1), как и call_dispositions у голоса (config.rs).
+        let status_weights = match cfg.sms_delivery_success_rate {
+            Some(sr) => {
+                let sr = sr.clamp(0.0, 1.0);
+                let rest = 1.0 - sr;
+                [rest * 5.0 / 6.0, sr, rest * 1.0 / 6.0]
+            }
+            None => [0.1, 0.88, 0.02],
+        };
         let status_dist = WeightedIndex::new(&status_weights).unwrap();
 
         let segments_weights = [0.85, 0.13, 0.02];
@@ -499,10 +509,29 @@ pub struct DataGenerator {
     network_elements: Vec<String>,
     sgw_elements: Vec<String>,
     pgw_elements: Vec<String>,
+    // events.data.volume_uplink/volume_downlink (mu, sigma, min_bytes) —
+    // None означает «конфиг не задал events.data», тогда draw_session
+    // берёт прежнюю зашитую по-RAT таблицу (Normal, 1-12 МБ), которая
+    // расходилась с конфигом контура и объясняла −28.6% объёма выхода.
+    volume_uplink: Option<(f64, f64, f64)>,
+    volume_downlink: Option<(f64, f64, f64)>,
 }
 
 impl DataGenerator {
     pub fn new(cells_by_rat: HashMap<String, Vec<u32>>, cells_all: Vec<u32>, network_elements: Vec<String>) -> Self {
+        Self::new_with_volume(cells_by_rat, cells_all, network_elements, None, None)
+    }
+
+    /// То же самое, но с объёмами data-сессии из `events.data.*`
+    /// контурного конфига (contour.rs::DataEventsCfg) вместо зашитой
+    /// таблицы. `None` в любом из аргументов — используется дефолт.
+    pub fn new_with_volume(
+        cells_by_rat: HashMap<String, Vec<u32>>,
+        cells_all: Vec<u32>,
+        network_elements: Vec<String>,
+        volume_uplink: Option<(f64, f64, f64)>,
+        volume_downlink: Option<(f64, f64, f64)>,
+    ) -> Self {
         let rat_weights = [0.3, 0.5, 0.2];
         let rat_dist = WeightedIndex::new(&rat_weights).unwrap();
 
@@ -534,6 +563,8 @@ impl DataGenerator {
             network_elements,
             sgw_elements,
             pgw_elements,
+            volume_uplink,
+            volume_downlink,
         }
     }
 
@@ -569,10 +600,27 @@ impl DataGenerator {
         let dur = (dur_normal.sample(rng) as f64).abs().max(5.0) as i64;
         let end_local = start_local + Duration::seconds(dur);
 
-        let down_normal = Normal::new(down_mean, down_sd).unwrap();
-        let down = (down_normal.sample(rng) as f64).abs().max(2_000.0) as u64;
-        let up = (down as f64 * rng.gen_range(up_ratio_min..=up_ratio_max))
-            .max(1_000.0) as u64;
+        // Объём сессии — из events.data.volume_uplink/volume_downlink
+        // конфига (lognormal, независимо по каждому направлению — как
+        // у питона `generators/data.py`), если конфиг их задал; иначе
+        // прежняя зашитая по-RAT таблица (Normal, down затем up как доля
+        // down) — единственный путь без --config или со старым плоским.
+        let (down, up) = match (self.volume_downlink, self.volume_uplink) {
+            (Some((down_mu, down_sigma, down_min)), Some((up_mu, up_sigma, up_min))) => {
+                let down_dist = LogNormal::new(down_mu, down_sigma).unwrap();
+                let down = down_dist.sample(rng).max(down_min) as u64;
+                let up_dist = LogNormal::new(up_mu, up_sigma).unwrap();
+                let up = up_dist.sample(rng).max(up_min) as u64;
+                (down, up)
+            }
+            _ => {
+                let down_normal = Normal::new(down_mean, down_sd).unwrap();
+                let down = (down_normal.sample(rng) as f64).abs().max(2_000.0) as u64;
+                let up = (down as f64 * rng.gen_range(up_ratio_min..=up_ratio_max))
+                    .max(1_000.0) as u64;
+                (down, up)
+            }
+        };
 
         let apn = match self.apn_dist.sample(rng) {
             0 => "internet",
@@ -1059,7 +1107,13 @@ pub fn worker_generate_shard(
     // Initialize generators
     let call_gen = CallGenerator::new(cfg);
     let sms_gen = SmsGenerator::new(cfg);
-    let data_gen = DataGenerator::new(HashMap::new(), vec![], cfg.network_elements.clone());
+    let data_gen = DataGenerator::new_with_volume(
+        HashMap::new(),
+        vec![],
+        cfg.network_elements.clone(),
+        cfg.data_volume_uplink,
+        cfg.data_volume_downlink,
+    );
 
     let day_str = day.format("%Y-%m-%d").to_string();
     let date_compact = day.format("%Y%m%d").to_string();
@@ -1200,11 +1254,41 @@ pub fn worker_generate_shard(
         day_start_local + Duration::seconds(offset_secs)
     };
 
-    // Префиксы численно — для 30%-й ветки «внешний номер» (не из базы).
-    let numeric_prefixes: Vec<u64> = cfg.prefixes
-        .iter()
-        .map(|s| s.parse().unwrap_or(31612))
-        .collect();
+    // Префиксы численно — для ветки «внешний номер» (не из базы). Если
+    // конфиг задал subscribers.external_numbers.prefixes с весами —
+    // используем их (WeightedIndex), иначе прежний равновероятный список
+    // cfg.prefixes (было раньше единственным источником).
+    let (numeric_prefixes, external_prefix_dist): (Vec<u64>, Option<WeightedIndex<f64>>) =
+        if !cfg.external_number_prefixes.is_empty() {
+            let prefixes: Vec<u64> = cfg.external_number_prefixes.iter().map(|(p, _)| *p).collect();
+            let weights: Vec<f64> = cfg.external_number_prefixes.iter().map(|(_, w)| w.max(1e-9)).collect();
+            (prefixes, WeightedIndex::new(&weights).ok())
+        } else {
+            let prefixes: Vec<u64> = cfg.prefixes.iter().map(|s| s.parse().unwrap_or(31612)).collect();
+            (prefixes, None)
+        };
+    // Доля внешних звонков/SMS и порог "внешний+книга" — из
+    // subscribers.contact_book конфига, если он задан, иначе прежние
+    // константы contact_book.rs (EXTERNAL_CALL_RATIO=0.15/REPEAT_CALL_PROBABILITY,
+    // которые раньше расходились с demo-cdr.yaml, где 0.12).
+    let external_call_ratio = cfg.contact_book_external_call_ratio.unwrap_or(EXTERNAL_CALL_RATIO);
+    let repeat_call_probability = cfg
+        .contact_book_repeat_call_probability
+        .unwrap_or(crate::contact_book::REPEAT_CALL_PROBABILITY);
+    let contact_threshold = if cfg.contact_book_external_call_ratio.is_some() {
+        external_call_ratio + (1.0 - external_call_ratio) * repeat_call_probability
+    } else {
+        CONTACT_THRESHOLD
+    };
+    let draw_external_msisdn = |rng: &mut StdRng| -> u64 {
+        let prefix_idx = match &external_prefix_dist {
+            Some(dist) => dist.sample(rng),
+            None => rng.gen_range(0..numeric_prefixes.len()),
+        };
+        let prefix = numeric_prefixes[prefix_idx];
+        let subscriber_number = rng.gen_range(0..10_000_000u64);
+        prefix * 10_000_000 + subscriber_number
+    };
 
     // Диапазон индексов в ОБЩЕМ пуле all_msisdns, обрабатываемый этим work
     // item'ом (этап 3+4: реальные ключи, а не арифметика по индексу; кусок
@@ -1274,13 +1358,11 @@ pub fn worker_generate_shard(
             // выпал у Zipf) откатываемся на случайного абонента, как и
             // питон делает при пустом contact_book.get() (`b_party.py:128`).
             let roll: f64 = rng.gen();
-            let other_msisdn: u64 = if roll < EXTERNAL_CALL_RATIO {
+            let is_external = roll < external_call_ratio;
+            let other_msisdn: u64 = if is_external {
                 DBG_EXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let prefix_idx = rng.gen_range(0..numeric_prefixes.len());
-                let prefix = numeric_prefixes[prefix_idx];
-                let subscriber_number = rng.gen_range(0..10_000_000u64);
-                prefix * 10_000_000 + subscriber_number
-            } else if roll < CONTACT_THRESHOLD {
+                draw_external_msisdn(&mut rng)
+            } else if roll < contact_threshold {
                 let my_contacts = contact_book.contacts_of(sub.msisdn);
                 if my_contacts.is_empty() {
                     DBG_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1361,6 +1443,37 @@ pub fn worker_generate_shard(
                 batches[mt_idx].push(mt_event.clone());
                 stats.calls += 1;
                 flush_if_full!(mt_idx);
+            } else if is_external {
+                // Внешний абонент не в нашей subscriber_db (redb) по
+                // построению — прежде MT-запись здесь молча не создавалась
+                // вовсе (see README, «нет mt_call для внешних адресатов»).
+                // served_imsi/served_imei для внешнего абонента нам не
+                // известны (это не наша сеть) — пусто, как остальные
+                // немоделируемые поля (docs/field-mapping.md).
+                let event_timestamp = mo_event.event_timestamp.clone();
+                let release_timestamp = mo_event.release_timestamp.clone();
+                let duration_seconds = mo_event.duration_seconds.clone();
+
+                let mt_event = event_pool.acquire();
+                mt_event.record_type = cdr_record_type("CALL", "MT").to_string();
+                mt_event.served_imsi = String::new();
+                mt_event.served_msisdn = other_msisdn.to_string();
+                mt_event.served_imei = String::new();
+                mt_event.calling_number = sub.msisdn.to_string();
+                mt_event.called_number = other_msisdn.to_string();
+                mt_event.event_timestamp = event_timestamp;
+                mt_event.release_timestamp = release_timestamp;
+                mt_event.duration_seconds = duration_seconds;
+                mt_event.first_cell_id = cell_id.to_string();
+                mt_event.last_cell_id = cell_id.to_string();
+                // Обслуживающий элемент — свой (сеть sub'а видит только
+                // свою сторону вызова на внешний номер), не внешний.
+                mt_event.serving_ne_id = assign_ne_id(sub.msisdn, &cfg.network_elements);
+
+                let mt_idx = route_writer_idx(&mt_event.serving_ne_id);
+                batches[mt_idx].push(mt_event.clone());
+                stats.calls += 1;
+                flush_if_full!(mt_idx);
             }
         }
 
@@ -1371,13 +1484,11 @@ pub fn worker_generate_shard(
             // Тот же трёхуровневый выбор собеседника, что и у звонков выше
             // (книга контактов общая для всех типов событий абонента).
             let roll: f64 = rng.gen();
-            let other_msisdn: u64 = if roll < EXTERNAL_CALL_RATIO {
+            let sms_is_external = roll < external_call_ratio;
+            let other_msisdn: u64 = if sms_is_external {
                 DBG_EXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let prefix_idx = rng.gen_range(0..numeric_prefixes.len());
-                let prefix = numeric_prefixes[prefix_idx];
-                let subscriber_number = rng.gen_range(0..10_000_000u64);
-                prefix * 10_000_000 + subscriber_number
-            } else if roll < CONTACT_THRESHOLD {
+                draw_external_msisdn(&mut rng)
+            } else if roll < contact_threshold {
                 let my_contacts = contact_book.contacts_of(sub.msisdn);
                 if my_contacts.is_empty() {
                     DBG_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1440,6 +1551,28 @@ pub fn worker_generate_shard(
                     stats.sms += 1;
                     flush_if_full!(mt_idx);
                 }
+            } else if sms_is_external {
+                // Тот же пробел, что и у CALL выше: внешний адресат SMS не
+                // в redb, MT молча не создавался — то же исправление.
+                let event_timestamp = mo_event.event_timestamp.clone();
+                let duration_seconds = mo_event.duration_seconds.clone();
+                let mt_event = event_pool.acquire();
+                mt_event.record_type = cdr_record_type("SMS", "MT").to_string();
+                mt_event.served_imsi = String::new();
+                mt_event.served_msisdn = other_msisdn.to_string();
+                mt_event.served_imei = String::new();
+                mt_event.calling_number = sub.msisdn.to_string();
+                mt_event.called_number = other_msisdn.to_string();
+                mt_event.event_timestamp = event_timestamp;
+                mt_event.duration_seconds = duration_seconds;
+                mt_event.first_cell_id = cell_id.to_string();
+                mt_event.last_cell_id = cell_id.to_string();
+                mt_event.serving_ne_id = assign_ne_id(sub.msisdn, &cfg.network_elements);
+
+                let mt_idx = route_writer_idx(&mt_event.serving_ne_id);
+                batches[mt_idx].push(mt_event.clone());
+                stats.sms += 1;
+                flush_if_full!(mt_idx);
             }
         }
 

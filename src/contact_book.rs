@@ -55,6 +55,20 @@ impl ContactBook {
     /// РАЗ в main.rs, до разбиения на work item'ы (день × кусок пула), и
     /// раздаётся всем воркерам через Arc — как и общий пул `all_msisdns`.
     pub fn build(all_msisdns: &[u64], book_seed: u64) -> Self {
+        Self::build_with_params(all_msisdns, book_seed, ZIPF_A, MIN_DEGREE, MAX_DEGREE)
+    }
+
+    /// То же самое, но с параметрами Zipf из контурного конфига
+    /// (`subscribers.contact_book.degree_distribution`) вместо зашитых
+    /// констант модуля — main.rs зовёт эту форму, когда конфиг задал
+    /// секцию `contact_book`, иначе — `build()` с прежними дефолтами.
+    pub fn build_with_params(
+        all_msisdns: &[u64],
+        book_seed: u64,
+        zipf_a: f64,
+        min_degree: usize,
+        max_degree: usize,
+    ) -> Self {
         let n = all_msisdns.len();
         let mut books: HashMap<u64, Vec<u64>> = HashMap::with_capacity(n);
         if n < 2 {
@@ -64,13 +78,13 @@ impl ContactBook {
             return ContactBook { books };
         }
 
-        let effective_max = MAX_DEGREE.min(n - 1);
-        let effective_min = MIN_DEGREE.min(effective_max).max(1);
+        let effective_max = max_degree.min(n - 1);
+        let effective_min = min_degree.min(effective_max).max(1);
 
         let mut rng = StdRng::seed_from_u64(book_seed);
 
         for (idx, &msisdn) in all_msisdns.iter().enumerate() {
-            let degree = sample_zipf_degree(ZIPF_A, effective_min, effective_max, &mut rng)
+            let degree = sample_zipf_degree(zipf_a, effective_min, effective_max, &mut rng)
                 .min(n - 1);
             if degree == 0 {
                 books.insert(msisdn, Vec::new());
