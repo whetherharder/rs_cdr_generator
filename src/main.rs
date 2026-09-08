@@ -400,6 +400,22 @@ fn handle_generate_cdr(
     let subs = all_msisdns.len();
     println!("Loaded {} subscribers from database\n", subs);
 
+    // Книга контактов строится РАЗ на весь прогон, здесь, а не внутри
+    // worker_generate_shard — иначе она пересобиралась бы на каждый work
+    // item (день × кусок пула) и круг общения абонента прыгал бы между
+    // сутками (требование этапа: детерминизм от seed и состава абонентов,
+    // независимость от периода дат и числа воркеров). Seed книги — свой,
+    // не завязанный на day_idx/chunk_idx, которые определяют seed события.
+    let book_seed = seed.wrapping_add(0x636f6e74616374); // "contact" в hex, чтобы не совпасть с seed событий
+    let contact_book = Arc::new(rs_cdr_generator::contact_book::ContactBook::build(&all_msisdns, book_seed));
+    println!("Contact book built for {} subscribers\n", subs);
+    if std::env::var("CB_DEBUG").is_ok() {
+        let lens: Vec<usize> = all_msisdns.iter().map(|m| contact_book.contacts_of(*m).len()).collect();
+        let empty = lens.iter().filter(|&&l| l == 0).count();
+        let mean = lens.iter().sum::<usize>() as f64 / lens.len().max(1) as f64;
+        eprintln!("CB_DEBUG n={} empty={} mean_degree={:.2} sample_first={:?}", lens.len(), empty, mean, &all_msisdns[..3.min(all_msisdns.len())].iter().map(|m| contact_book.contacts_of(*m).to_vec()).collect::<Vec<_>>());
+    }
+
     let redb_arc = Arc::new(redb);
 
     // Дни и день-каталоги готовим заранее — воркеры разных дней теперь
@@ -525,6 +541,7 @@ fn handle_generate_cdr(
                 chunk_idx,
                 range,
                 &all_msisdns,
+                &contact_book,
                 &cfg,
                 &out,
                 &redb_arc,
@@ -574,6 +591,16 @@ fn handle_generate_cdr(
     // ещё один архив незачем и ломало бы ожидаемое имя файла.
     let _ = cleanup_after_archive;
 
+    if std::env::var("CB_DEBUG").is_ok() {
+        use std::sync::atomic::Ordering::Relaxed;
+        eprintln!(
+            "CB_DEBUG selection: ext={} book={} fallback={} rand={}",
+            rs_cdr_generator::generators::DBG_EXT.load(Relaxed),
+            rs_cdr_generator::generators::DBG_BOOK.load(Relaxed),
+            rs_cdr_generator::generators::DBG_FALLBACK.load(Relaxed),
+            rs_cdr_generator::generators::DBG_RAND.load(Relaxed),
+        );
+    }
     println!("\n=== CDR Generation Complete ===");
 
     Ok(())

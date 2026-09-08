@@ -1,6 +1,16 @@
 // Event generation logic for CALL, SMS, and DATA events
 use crate::async_writer::{EventBatch, WriterMessage};
 use crate::config::Config;
+use crate::contact_book::{ContactBook, CONTACT_THRESHOLD, EXTERNAL_CALL_RATIO};
+// Счётчики тира выбора собеседника (внешний/книга/пусто-книга-fallback/
+// случайный) — печатаются при `CB_DEBUG=1` (main.rs) для проверки, что
+// реальные пропорции соответствуют CONTACT_THRESHOLD/EXTERNAL_CALL_RATIO
+// на конкретном прогоне, а не только по формуле. Relaxed — счётчик
+// диагностический, порядок операций между воркерами не важен.
+pub static DBG_EXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static DBG_BOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static DBG_FALLBACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static DBG_RAND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 use crate::event_pool::EventPool;
 use crate::identity::{build_contacts, build_subscribers, gen_imei, Subscriber};
 use crate::subscriber_db::SubscriberDatabase;
@@ -863,6 +873,10 @@ pub fn worker_generate(
 /// по индексу serving_ne_id обслуженного абонента, поэтому каждую пару
 /// (ne_id, дата) пишет ровно одна задача независимо от того, сколько работ
 /// (день, кусок пула) отправили в неё события.
+/// `contact_book` — постоянная книга контактов (см. `crate::contact_book`),
+/// построенная РАЗ на весь прогон в main.rs и общая для всех work item'ов,
+/// как и `all_msisdns`: круг общения абонента не должен зависеть ни от дня,
+/// ни от куска пула, который его в этот день обслуживает.
 #[allow(clippy::too_many_arguments)]
 pub fn worker_generate_shard(
     day: DateTime<chrono_tz::Tz>,
@@ -870,6 +884,7 @@ pub fn worker_generate_shard(
     chunk_idx: usize,
     idx_range: (usize, usize),
     all_msisdns: &Arc<Vec<u64>>,
+    contact_book: &Arc<ContactBook>,
     cfg: &Config,
     out_dir: &Path,
     redb: &Arc<SubscriberDbRedb>,
@@ -1028,19 +1043,34 @@ pub fn worker_generate_shard(
         for _ in 0..n_calls {
             let start_local = sample_time(&mut rng);
 
-            // Этап 4, требование 3: собеседник звонка — из ОБЩЕГО пула
-            // абонентов all_msisdns (видимого каждому work item целиком),
-            // а не из диапазона своего воркера/куска — иначе граф контактов
-            // разрежен границами шардов (см. докстринг функции выше).
-            // 30% — номер вне базы (другой оператор), как и раньше: MT-запись
-            // для него не генерируется (см. lookup ниже).
-            let other_msisdn: u64 = if rng.gen::<f64>() < 0.7 {
-                all_msisdns[rng.gen_range(0..all_msisdns.len())]
-            } else {
+            // Собеседник звонка — трёхуровневый выбор, как у питона
+            // (`b_party.py`, docstring): внешний номер (EXTERNAL_CALL_RATIO),
+            // затем постоянная книга контактов абонента (CONTACT_THRESHOLD),
+            // иначе — случайный абонент из ОБЩЕГО пула all_msisdns (видимого
+            // каждому work item целиком — иначе граф разрежен границами
+            // шардов, см. докстринг функции выше). Книга не пуста лишь пока
+            // у абонента есть круг общения — при пустой книге (degree=0
+            // выпал у Zipf) откатываемся на случайного абонента, как и
+            // питон делает при пустом contact_book.get() (`b_party.py:128`).
+            let roll: f64 = rng.gen();
+            let other_msisdn: u64 = if roll < EXTERNAL_CALL_RATIO {
+                DBG_EXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let prefix_idx = rng.gen_range(0..numeric_prefixes.len());
                 let prefix = numeric_prefixes[prefix_idx];
                 let subscriber_number = rng.gen_range(0..10_000_000u64);
                 prefix * 10_000_000 + subscriber_number
+            } else if roll < CONTACT_THRESHOLD {
+                let my_contacts = contact_book.contacts_of(sub.msisdn);
+                if my_contacts.is_empty() {
+                    DBG_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    all_msisdns[rng.gen_range(0..all_msisdns.len())]
+                } else {
+                    DBG_BOOK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    my_contacts[rng.gen_range(0..my_contacts.len())]
+                }
+            } else {
+                DBG_RAND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                all_msisdns[rng.gen_range(0..all_msisdns.len())]
             };
 
             let cell_id = rng.gen_range(10_000..100_000);
@@ -1088,8 +1118,17 @@ pub fn worker_generate_shard(
                 mt_event.served_imsi = other_snapshot.imsi.to_string();
                 mt_event.served_msisdn = other_snapshot.msisdn.to_string();
                 mt_event.served_imei = other_snapshot.imei.to_string();
-                mt_event.calling_number = other_msisdn.to_string();
-                mt_event.called_number = sub.msisdn.to_string();
+                // Направление MT-записи — то же, что у MO (calling=инициатор
+                // звонка, called=собеседник), а не развёрнутое: это одна и
+                // та же попытка звонка, увиденная с двух коммутаторов, а не
+                // "обратный звонок" (сверено с питоном, `voice.py`, mt-запись
+                // сохраняет calling/called без перестановки). Прежняя
+                // перестановка здесь была багом: она форсировала directed
+                // (A→B) и (B→A) на КАЖДЫЙ звонок, поэтому граф контактов
+                // выходил симметричным на 100% вместо ожидаемых ~1% у питона
+                // (см. docs/contact-graph-and-memory-2026-09-08.md, задача 1).
+                mt_event.calling_number = sub.msisdn.to_string();
+                mt_event.called_number = other_msisdn.to_string();
                 mt_event.event_timestamp = event_timestamp;
                 mt_event.release_timestamp = release_timestamp;
                 mt_event.duration_seconds = duration_seconds;
@@ -1108,14 +1147,27 @@ pub fn worker_generate_shard(
         for _ in 0..n_sms {
             let start_local = sample_time(&mut rng);
 
-            // Тот же общий пул для собеседника, что и у звонков (этап 4).
-            let other_msisdn: u64 = if rng.gen::<f64>() < 0.7 {
-                all_msisdns[rng.gen_range(0..all_msisdns.len())]
-            } else {
+            // Тот же трёхуровневый выбор собеседника, что и у звонков выше
+            // (книга контактов общая для всех типов событий абонента).
+            let roll: f64 = rng.gen();
+            let other_msisdn: u64 = if roll < EXTERNAL_CALL_RATIO {
+                DBG_EXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let prefix_idx = rng.gen_range(0..numeric_prefixes.len());
                 let prefix = numeric_prefixes[prefix_idx];
                 let subscriber_number = rng.gen_range(0..10_000_000u64);
                 prefix * 10_000_000 + subscriber_number
+            } else if roll < CONTACT_THRESHOLD {
+                let my_contacts = contact_book.contacts_of(sub.msisdn);
+                if my_contacts.is_empty() {
+                    DBG_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    all_msisdns[rng.gen_range(0..all_msisdns.len())]
+                } else {
+                    DBG_BOOK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    my_contacts[rng.gen_range(0..my_contacts.len())]
+                }
+            } else {
+                DBG_RAND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                all_msisdns[rng.gen_range(0..all_msisdns.len())]
             };
 
             let cell_id = rng.gen_range(10_000..100_000);
