@@ -1507,13 +1507,24 @@ pub fn worker_generate_shard(
                 batches[mt_idx].push(mt_event.clone());
                 stats.calls += 1;
                 flush_if_full!(mt_idx);
-            } else if is_external {
-                // Внешний абонент не в нашей subscriber_db (redb) по
-                // построению — прежде MT-запись здесь молча не создавалась
-                // вовсе (see README, «нет mt_call для внешних адресатов»).
-                // served_imsi/served_imei для внешнего абонента нам не
-                // известны (это не наша сеть) — пусто, как остальные
-                // немоделируемые поля (docs/field-mapping.md).
+            } else {
+                // Было `else if is_external` — для внутреннего абонента без
+                // валидного снапшота на day_start_ts (churn: ушёл до звонка
+                // или ещё не подключился, valid_from/valid_to не покрывает
+                // момент) MT молча не порождался вовсе, хотя MO уже записан.
+                // Решение по существу: попытка дозвона состоялась (MO —
+                // это заявка вызывающего коммутатора, она не знает заранее,
+                // жив ли абонент на другом конце), значит MT тоже должен
+                // быть — той же формы, что уже сделана для внешних абонентов
+                // веткой ниже. Другого пути было бы два: не порождать MO
+                // (пересчитывать бы пришлось postfactum, MO уже в батче)
+                // либо перевыбрать собеседника (расходится с питоном, где
+                // невалидных во времени b_party не бывает вовсе —
+                // `b_party.py` не проверяет valid_from/valid_to, отсюда и
+                // расхождение mt_call/mo_call с конфижным success_rate:
+                // 0.85). served_imsi/served_imei неизвестны в обоих случаях
+                // — мы не видим устройство на другом конце ни для внешнего
+                // номера, ни для внутреннего без снапшота.
                 let event_timestamp = mo_event.event_timestamp.clone();
                 let answer_timestamp = mo_event.answer_timestamp.clone();
                 let release_timestamp = mo_event.release_timestamp.clone();
@@ -1534,9 +1545,17 @@ pub fn worker_generate_shard(
                 mt_event.duration_seconds = duration_seconds;
                 mt_event.first_cell_id = cell_id.to_string();
                 mt_event.last_cell_id = cell_id.to_string();
-                // Обслуживающий элемент — свой (сеть sub'а видит только
-                // свою сторону вызова на внешний номер), не внешний.
-                mt_event.serving_ne_id = assign_ne_id(sub.msisdn, &cfg.network_elements);
+                mt_event.serving_ne_id = if is_external {
+                    // Внешний — сеть sub'а видит только свою сторону вызова
+                    // на внешний номер, чужой NE нам не известен.
+                    assign_ne_id(sub.msisdn, &cfg.network_elements)
+                } else {
+                    // Внутренний без снапшота — assign_ne_id детерминирован
+                    // по msisdn и не зависит от наличия снапшота, поэтому
+                    // берём NE так же, как взял бы валидный случай выше
+                    // (строка с assign_ne_id(other_snapshot.msisdn, ...)).
+                    assign_ne_id(other_msisdn, &cfg.network_elements)
+                };
 
                 let mt_idx = route_writer_idx(&mt_event.serving_ne_id);
                 batches[mt_idx].push(mt_event.clone());
@@ -1621,9 +1640,14 @@ pub fn worker_generate_shard(
                     stats.sms += 1;
                     flush_if_full!(mt_idx);
                 }
-            } else if sms_is_external {
-                // Тот же пробел, что и у CALL выше: внешний адресат SMS не
-                // в redb, MT молча не создавался — то же исправление.
+            } else {
+                // Было `else if sms_is_external` — тот же пробел, что и у
+                // CALL выше, для внутреннего адресата без снапшота на
+                // day_start_ts (churn). У SMS нет `is_answered`-гейта
+                // (delivery_success_rate сэмплируется в статус MO-записи,
+                // не в решение «создавать ли MT» — mt_sms порождается
+                // безусловно), поэтому починка здесь — то же расширение
+                // `else if is_external` до `else`, без доп. условий.
                 let event_timestamp = mo_event.event_timestamp.clone();
                 let duration_seconds = mo_event.duration_seconds.clone();
                 let consolidation_id = mo_event.consolidation_id.clone();
@@ -1639,7 +1663,11 @@ pub fn worker_generate_shard(
                 mt_event.duration_seconds = duration_seconds;
                 mt_event.first_cell_id = cell_id.to_string();
                 mt_event.last_cell_id = cell_id.to_string();
-                mt_event.serving_ne_id = assign_ne_id(sub.msisdn, &cfg.network_elements);
+                mt_event.serving_ne_id = if sms_is_external {
+                    assign_ne_id(sub.msisdn, &cfg.network_elements)
+                } else {
+                    assign_ne_id(other_msisdn, &cfg.network_elements)
+                };
 
                 let mt_idx = route_writer_idx(&mt_event.serving_ne_id);
                 batches[mt_idx].push(mt_event.clone());
