@@ -1075,15 +1075,39 @@ pub fn worker_generate_shard(
         .map(|_| EventBatch::new(batch_capacity, &date_compact))
         .collect();
 
-    // Индекс сетевого элемента абонента → индекс writer-задачи. Тот же
-    // хеш, что и assign_ne_id (msisdn % network_elements.len()), поэтому
-    // маршрутизация согласована с serving_ne_id, который реально попадёт
-    // в событие: одну пару (ne_id, дата) всегда пишет одна и та же задача.
-    let network_elements_len = cfg.network_elements.len().max(1);
+    // Индекс сетевого элемента → индекс writer-задачи, ПО РЕАЛЬНОМУ
+    // serving_ne_id события, а не пересчётом из msisdn.
+    //
+    // Раньше индекс писателя вычислялся заново как `msisdn % network_elements
+    // .len()`, в предположении, что это всегда тот же индекс, что даёт
+    // assign_ne_id. Для CALL/SMS так и есть — assign_ne_id берёт элемент из
+    // ПОЛНОГО cfg.network_elements. Но для DATA (DataGenerator::fill_side)
+    // ne_id берётся из ПОДСПИСКА — sgw_elements/pgw_elements (только id,
+    // содержащие "sgw"/"pgw"), длина которого меньше полного списка (в
+    // дефолтном конфиге — 1 против 5). `msisdn % 5`, применённый как индекс
+    // подсписка длины 1, давал значения 0..4, размазанные `% writer_tasks`
+    // по РАЗНЫМ writer-задачам — хотя реальный ne_id для всех этих событий
+    // один и тот же ("sgw-01"/"pgw-01"). Несколько задач параллельно
+    // открывали (`File::create`, усечение) и писали в один и тот же
+    // gzip-файл (writer.rs, EventWriter::write_row) — gzip-поток портился
+    // без единой строки в логе: `gzip -t` находит CRC/data-stream error
+    // (воспроизведено на 2000 абонентов / 5 суток / 6 воркеров: 10 из 25
+    // файлов sgw-01/pgw-01 побиты, msc/smsc целы — те же симптомы, что
+    // и на боевом прогоне 12 000×240).
+    //
+    // Починка: маршрутизировать по САМОМУ ne_id (его позиции в полном
+    // cfg.network_elements), а не пересчитывать индекс заново из msisdn.
+    // Тогда неважно, из какого пула (полного или подсписка) ne_id выбран —
+    // одна и та же строка ne_id всегда даёт один и тот же индекс задачи,
+    // и пара (ne_id, дата) остаётся собственностью ровно одной задачи.
     let writer_tasks = writer_channels.len().max(1);
-    let route_writer_idx = |served_msisdn: u64| -> usize {
-        let ne_idx = (served_msisdn as usize) % network_elements_len;
-        ne_idx % writer_tasks
+    let route_writer_idx = |ne_id: &str| -> usize {
+        let ne_pos = cfg
+            .network_elements
+            .iter()
+            .position(|id| id == ne_id)
+            .unwrap_or(0);
+        ne_pos % writer_tasks
     };
     macro_rules! flush_if_full {
         ($idx:expr) => {
@@ -1285,7 +1309,7 @@ pub fn worker_generate_shard(
                 "MO",
             );
 
-            let mo_idx = route_writer_idx(sub.msisdn);
+            let mo_idx = route_writer_idx(&mo_event.serving_ne_id);
             batches[mo_idx].push(mo_event.clone());
             stats.calls += 1;
             flush_if_full!(mo_idx);
@@ -1333,7 +1357,7 @@ pub fn worker_generate_shard(
                 mt_event.last_cell_id = cell_id.to_string();
                 mt_event.serving_ne_id = assign_ne_id(other_snapshot.msisdn, &cfg.network_elements);
 
-                let mt_idx = route_writer_idx(other_snapshot.msisdn);
+                let mt_idx = route_writer_idx(&mt_event.serving_ne_id);
                 batches[mt_idx].push(mt_event.clone());
                 stats.calls += 1;
                 flush_if_full!(mt_idx);
@@ -1379,7 +1403,7 @@ pub fn worker_generate_shard(
             sms_gen.generate_forced_direction(
                 mo_event, sub, start_local, other_msisdn, tz_name, cell_id, &mut rng, "MO",
             );
-            let mo_idx = route_writer_idx(sub.msisdn);
+            let mo_idx = route_writer_idx(&mo_event.serving_ne_id);
             batches[mo_idx].push(mo_event.clone());
             stats.sms += 1;
             flush_if_full!(mo_idx);
@@ -1411,7 +1435,7 @@ pub fn worker_generate_shard(
                     mt_event.last_cell_id = cell_id.to_string();
                     mt_event.serving_ne_id = assign_ne_id(other_snapshot.msisdn, &cfg.network_elements);
 
-                    let mt_idx = route_writer_idx(other_snapshot.msisdn);
+                    let mt_idx = route_writer_idx(&mt_event.serving_ne_id);
                     batches[mt_idx].push(mt_event.clone());
                     stats.sms += 1;
                     flush_if_full!(mt_idx);
@@ -1428,14 +1452,14 @@ pub fn worker_generate_shard(
 
             let sgw_event = event_pool.acquire();
             data_gen.fill_side(sgw_event, sub, &draw, "sgw_data", DataSide::Sgw);
-            let sgw_idx = route_writer_idx(sub.msisdn);
+            let sgw_idx = route_writer_idx(&sgw_event.serving_ne_id);
             batches[sgw_idx].push(sgw_event.clone());
             stats.data += 1;
             flush_if_full!(sgw_idx);
 
             let pgw_event = event_pool.acquire();
             data_gen.fill_side(pgw_event, sub, &draw, "pgw_data", DataSide::Pgw);
-            let pgw_idx = route_writer_idx(sub.msisdn);
+            let pgw_idx = route_writer_idx(&pgw_event.serving_ne_id);
             batches[pgw_idx].push(pgw_event.clone());
             stats.data += 1;
             flush_if_full!(pgw_idx);
