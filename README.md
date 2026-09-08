@@ -108,29 +108,63 @@ docker run --rm -v $(pwd)/data:/data rs-cdr-generator:contour \
 можно было только целевой проверкой; выборочная проверка её пропустила бы
 с высокой вероятностью (40 % файлов битых, но не все).
 
-🔴 **Известное ограничение (не устранено в этой правке): часть контурного
-YAML генератор не читает, а берёт из зашитых дефолтов.** Строго типизированно
-разбираются только `meta.seed`, `meta.time_range.*`, `subscribers.total_count`,
-`subscribers.profiles[].{name,weight,daily_rates}` и `network.elements`/
-`network.cells` (`src/contour.rs`). Секции, которые сейчас **игнорируются**
-(значение из конфига не долетает до генератора, используется дефолт кода):
+### Устранение хардкода (2026-09-08, вторая правка)
 
-- `events.*` целиком — включая `events.voice.success_rate` (доля неотвеченных
-  звонков), `events.data.*` (объёмы, множители профиля), `events.sms.*`;
-- `subscribers.contact_book.*` (книга контактов, `external_call_ratio`);
-- `subscribers.external_numbers.*` (пул внешних номеров);
-- `subscribers.imsi_prefix`/`msisdn_prefix`;
-- `meta.output.*`, `meta.parallelism.*`;
-- `network.operator.*`, `network.auto_generate.*`,
-  `network.cells.source`/`file_path`;
-- `subscribers.profiles[].{hourly_weights,day_of_week_multipliers,mobility,
-  imei_tac_pool,rat_preference}`.
+Секции, которые раньше **игнорировались** (значение из конфига не долетало
+до генератора, использовался дефолт кода), теперь читаются типизированно
+(`src/contour.rs`) и применяются (`src/config.rs::apply_contour_config`,
+`generators.rs`, `contact_book.rs`, `main.rs`):
 
-Это не устройство программы, а долг: понятия `success_rate` в rust-версии
-сейчас нет, внешние `mt_call` не порождаются книгой контактов, и доли типов
-трафика поэтому не совпадают с питоном на 1–3 процентных пункта даже на
-одинаковом конфиге. Список приведён как перечень работ для следующего
-исполнителя, а не как объяснённая особенность.
+| Было в дефолтах (зашито в коде) | Стало из конфига |
+|---|---|
+| `call_dispositions` ANSWERED=0.82 фиксированно | `events.voice.success_rate` → ANSWERED=`success_rate`, остаток делится в прежней пропорции между NO ANSWER/BUSY/FAILED/CONGESTION |
+| SMS status-веса `[0.1, 0.88, 0.02]` фиксированно | `events.sms.delivery_success_rate` → DELIVERED=`success_rate`, остаток делится 5:1 между SENT/FAILED |
+| `contact_book::EXTERNAL_CALL_RATIO=0.15` (расходилось с конфигом, где 0.12) | `subscribers.contact_book.external_call_ratio` |
+| `contact_book::{ZIPF_A, MIN_DEGREE, MAX_DEGREE, REPEAT_CALL_PROBABILITY}` | `subscribers.contact_book.degree_distribution.params.{a,min,max}`, `repeat_call_probability` |
+| Внешний номер — равновероятный `cfg.prefixes` | `subscribers.external_numbers.prefixes[].weight` (`WeightedIndex`) |
+| Объём data-сессии — `Normal` по RAT (1–12 МБ, зашито) | `events.data.volume_uplink`/`volume_downlink` (lognormal `mu`/`sigma`/`min_bytes`) |
+| **Дефект**: `mt_call`/`mt_sms` для внешнего адресата не порождались вовсе (MT собирался только если `other_msisdn` найден в subscriber_db, а внешние туда не попадают) | MT-запись для внешнего адресата теперь строится (served_imsi/served_imei пусто — абонент не наш, как и остальные немоделируемые поля) |
+
+Осталось хардкодом (не входило в измеренные расхождения, требует более
+крупной переработки): `events.data.duration`/`profile_volume_multipliers`
+(объём всё ещё не различается по профилю абонента — у `Subscriber` нет поля
+профиля на уровне генерации data-сессии), `subscribers.profiles[].
+{hourly_weights,day_of_week_multipliers,mobility,imei_tac_pool,rat_preference}`,
+`subscribers.contact_book.{asymmetric,intra_profile_bias}`,
+`subscribers.imsi_prefix`/`msisdn_prefix`, `meta.output.*`/`meta.parallelism.*`,
+`network.operator.*`/`network.auto_generate.*`/`network.cells.source`.
+
+**Проверено контурным конфигом (12 000 абонентов, 240 суток,
+`demo-cdr.yaml` с `total_count: 12000`, идентичным прежнему замеру):**
+
+- `gzip -t` — 0 битых из 1200 файлов;
+- записей: **40 735 882** (mo_call 8 989 534, mt_call 8 891 930, mo_sms
+  4 010 249, mt_sms 3 966 809, sgw_data=pgw_data 7 438 680) — против прежних
+  38 789 435 (было) и питоновских 38 218 984. `mo_call`/`mt_call` теперь
+  почти симметричны (0.989 против прежних 0.84) — прямое следствие починки
+  внешнего `mt_call`, а не подгонки;
+- объём выхода: **1 352 869 293** байт против прежних 1 343 290 082 и
+  питоновских 1 881 417 409 — доля от питона практически не сдвинулась
+  (−28,1 % против −28,6 %). Гипотеза, почему объём data-сессии из lognormal
+  не дал ожидаемого сдвига, не подтвердилась подгонкой каких-либо
+  коэффициентов — сдвига по общему байтовому итогу просто нет, при этом
+  средний `downlink_volume_bytes` в контрольном прогоне (200 абонентов)
+  соответствует lognormal(12.5, 0.8) с точностью до сэмплирования (мера
+  верна, метрика зависит не от неё). **Вероятная причина** −28 % —
+  не объём data-полей, а систематически пустые CDR-поля из
+  `docs/field-mapping.md` (`sequence_number`, `consolidation_id`,
+  `charging_id`, `redirecting_number`, `answer_timestamp`,
+  `cause_for_termination`, `qci`, `vendor_extensions` — 8 из 26 колонок),
+  не входившие в задание этой правки и не проверенные здесь количественно.
+  **Не подтверждено, требует отдельного замера длины строки на пару
+  записей rust/питон.**
+
+`success_rate` теперь реально управляет диспозицией звонка (описанная
+выше пропорция), но разложение асимметрии 88 %/12 % из задания сверить
+не удалось: `cause_for_termination`/диспозиция не экспортируется в CSV
+(`field-mapping.md`, «у rust — только текстовая причина, не пишется в
+файл») — измерить долю ANSWERED/неуспеха по выходным файлам напрямую
+нельзя без отдельной инструментации. Осталось непроверенным.
 
 ### Опубликовано (2026-09-08)
 
