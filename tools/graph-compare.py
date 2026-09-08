@@ -4,10 +4,18 @@
 
 Читает выгрузки обоих генераторов (дерево <ne_id>/CDR_<ne_id>_<date>.csv.gz,
 формат общий для обеих версий — см. docs/field-mapping.md) и строит граф
-"звонков между абонентами" по записям record_type in {mo_call, mt_call}.
-SMS исключены из сравнения намеренно: в эталонном прогоне upstream-генератор
-не выдал ни одной SMS-записи при ненулевых лямбдах в конфиге (см. отчёт
-задачи 1) — сравнивать по SMS означало бы сравнивать пустое с непустым.
+"кто с кем взаимодействовал" ОТДЕЛЬНО по каждому типу трафика
+(mo_call/mt_call, mo_sms/mt_sms, sgw_data/pgw_data) и суммарно по CALL+SMS
+(запись — пара calling/called; DATA пары не образует, см. ниже).
+
+Раздельный счёт введён 2026-09-08: SMS-трафик асимметричнее голосового
+(рассылки, сервисные номера, односторонние цепочки), и доля взаимных пар
+вместе с распределением веса сдвигаются у CALL и SMS неодинаково — суммарная
+картина «CALL+SMS вместе» это скрывает.
+
+DATA (sgw_data/pgw_data) в графовые метрики (вес пары, взаимность, top-5,
+собеседники) не попадает намеренно: у data-сессии нет второй стороны
+(`called_number` пуст, см. docs/field-mapping.md) — считаются только записи.
 
 Запуск:
     python3 tools/graph-compare.py <python_out_dir> <rust_out_dir> [--half-day YYYY-MM-DD]
@@ -24,7 +32,14 @@ from pathlib import Path
 from statistics import mean, median
 
 
-CALL_TYPES = {"mo_call", "mt_call"}
+# Группы типов записи, по которым считаются графовые метрики раздельно,
+# плюс "all_pairs" — суммарно по CALL+SMS (у DATA пары нет, см. докстринг).
+TYPE_GROUPS = {
+    "call": {"mo_call", "mt_call"},
+    "sms": {"mo_sms", "mt_sms"},
+    "data": {"sgw_data", "pgw_data"},
+}
+PAIR_TYPES = TYPE_GROUPS["call"] | TYPE_GROUPS["sms"]
 
 
 def iter_records(root: Path):
@@ -50,17 +65,28 @@ def iter_records(root: Path):
                 yield row[i_type], row[i_call], row[i_cld], row[i_ts][:10], row[i_served]
 
 
-def build_graph(root: Path):
-    """Возвращает (served_set, directed_counter[(a,b)] = n, per_day_pair_counter)."""
+def record_type_counts(root: Path):
+    """Число записей КАЖДОГО record_type, без фильтра по типу или направлению —
+    для таблицы «сколько записей какого типа» в отчёте."""
+    counts = Counter()
+    for rtype, _calling, _called, _date, _served in iter_records(root):
+        counts[rtype] += 1
+    return counts
+
+
+def build_graph(root: Path, type_filter: set):
+    """Возвращает (served_set, directed_counter[(a,b)] = n, отсортированные даты, row_n)
+    по записям, чей record_type входит в type_filter. served — по ВСЕМ записям
+    независимо от type_filter (граница «кто абонент» не должна зависеть от того,
+    какой тип трафика сейчас считаем)."""
     served = set()
     directed = Counter()
-    per_half = {"1": Counter(), "2": Counter()}
     dates = set()
     row_n = 0
     for rtype, calling, called, date, served_msisdn in iter_records(root):
         served.add(served_msisdn)
         dates.add(date)
-        if rtype not in CALL_TYPES:
+        if rtype not in type_filter:
             continue
         if not calling or not called:
             continue
@@ -145,7 +171,7 @@ def contacts_per_subscriber(undirected: Counter):
     }
 
 
-def top5_stability(root: Path, served: set, dates: list, half_day: str | None):
+def top5_stability(root: Path, served: set, dates: list, half_day: str | None, type_filter: set):
     """Top-5 контактов по весу в первой и второй половине периода, средний Jaccard."""
     if not dates:
         return None
@@ -154,7 +180,7 @@ def top5_stability(root: Path, served: set, dates: list, half_day: str | None):
     half1 = Counter()
     half2 = Counter()
     for rtype, calling, called, date, served_msisdn in iter_records(root):
-        if rtype not in CALL_TYPES or not calling or not called:
+        if rtype not in type_filter or not calling or not called:
             continue
         if calling not in served or called not in served:
             continue
@@ -194,44 +220,74 @@ def top5_stability(root: Path, served: set, dates: list, half_day: str | None):
     }
 
 
-def analyze(label: str, root: Path, half_day: str | None, known_subs_file: Path | None = None):
-    served, directed, dates, row_n = build_graph(root)
-    if known_subs_file is not None:
-        # served_msisdn у питона загрязнён внешними номерами (см. отчёт задачи 1:
-        # даже при anomalies.enabled=false туда попадают +1212/... из external_numbers) —
-        # берём границу "кто внутренний абонент" из явного списка реальных MSISDN
-        # (subscribers.json ассетов), а не из значений поля served_msisdn в CSV.
-        known = set(known_subs_file.read_text().split())
-        print(f"известных абонентов из явного списка: {len(known)} (вместо {len(served)} по served_msisdn)")
-        served = known
+def resolve_known(root: Path, known_subs_file: Path | None, served_from_all: set):
+    if known_subs_file is None:
+        return served_from_all, False
+    # served_msisdn у питона загрязнён внешними номерами (см. отчёт задачи 1:
+    # даже при anomalies.enabled=false туда попадают +1212/... из external_numbers) —
+    # берём границу "кто внутренний абонент" из явного списка реальных MSISDN
+    # (subscribers.json ассетов), а не из значений поля served_msisdn в CSV.
+    known = set(known_subs_file.read_text().split())
+    return known, True
+
+
+def analyze_group(group_name: str, type_filter: set, root: Path, half_day: str | None, served: set):
+    """Метрики графа для одной группы типов записи на уже разрешённом served-множестве."""
+    _served_ignored, directed, dates, row_n = build_graph(root, type_filter)
     directed_internal = restrict_internal(directed, served)
     undirected = pair_weights(directed_internal)
 
-    print(f"\n=== {label} ({root}) ===")
-    print(f"served_msisdn (внутренние абоненты, встреченные хоть раз): {len(served)}")
-    print(f"дат в выгрузке: {len(dates)} ({dates[0]}..{dates[-1]})" if dates else "дат нет")
-    print(f"call-записей всего: {row_n}, из них внутренних (обе стороны — известный абонент): "
-          f"{sum(directed_internal.values())}")
-
     wd = weight_distribution(undirected)
-    print(f"распределение веса пары: {wd}")
-
     ms = mutual_share(directed_internal)
-    print(f"доля взаимных пар: {ms}")
-
     cps = contacts_per_subscriber(undirected)
-    print(f"уникальных собеседников на абонента: {cps}")
+    stab = top5_stability(root, served, dates, half_day, type_filter)
 
-    stab = top5_stability(root, served, dates, half_day)
-    print(f"устойчивость top-5 между половинами периода: {stab}")
+    print(f"  -- {group_name} ({sorted(type_filter)}) --")
+    print(f"  записей группы всего: {row_n}, из них внутренних (обе стороны — известный абонент): "
+          f"{sum(directed_internal.values())}")
+    print(f"  распределение веса пары: {wd}")
+    print(f"  доля взаимных пар: {ms}")
+    print(f"  уникальных собеседников на абонента: {cps}")
+    print(f"  устойчивость top-5 между половинами периода: {stab}")
 
     return {
-        "served": len(served),
+        "row_n": row_n,
         "weight_distribution": wd,
         "mutual_share": ms,
         "contacts_per_subscriber": cps,
         "top5_stability": stab,
     }
+
+
+def analyze(label: str, root: Path, half_day: str | None, known_subs_file: Path | None = None,
+            groups: dict | None = None):
+    if groups is None:
+        groups = dict(TYPE_GROUPS, all_pairs=PAIR_TYPES)
+
+    # served_set берём по ВСЕМ записям (build_graph с type_filter=множество всех
+    # встреченных типов даёт то же самое, что и старое поведение "по всем строкам").
+    all_types = set().union(*TYPE_GROUPS.values())
+    served_raw, _directed, dates, _row_n = build_graph(root, all_types)
+    served, used_known = resolve_known(root, known_subs_file, served_raw)
+
+    print(f"\n=== {label} ({root}) ===")
+    if used_known:
+        print(f"известных абонентов из явного списка: {len(served)} (вместо {len(served_raw)} по served_msisdn)")
+    else:
+        print(f"served_msisdn (внутренние абоненты, встреченные хоть раз): {len(served)}")
+    print(f"дат в выгрузке: {len(dates)} ({dates[0]}..{dates[-1]})" if dates else "дат нет")
+
+    counts = record_type_counts(root)
+    total = sum(counts.values())
+    print(f"записей по типам (всего {total}):")
+    for rt in sorted(counts):
+        share = round(100 * counts[rt] / total, 1) if total else 0.0
+        print(f"  {rt}: {counts[rt]} ({share}%)")
+
+    result = {"served": len(served), "record_type_counts": dict(counts), "groups": {}}
+    for gname, gtypes in groups.items():
+        result["groups"][gname] = analyze_group(gname, gtypes, root, half_day, served)
+    return result
 
 
 def main():
@@ -242,10 +298,16 @@ def main():
     ap.add_argument("--known-subs-python", type=Path, default=None,
                      help="Явный список реальных MSISDN питона (см. предупреждение о served_msisdn)")
     ap.add_argument("--known-subs-rust", type=Path, default=None)
+    ap.add_argument("--only-group", choices=sorted(TYPE_GROUPS) + ["all_pairs"], default=None,
+                     help="Считать только одну группу типов (для точечных прогонов, напр. динамики по периоду)")
     args = ap.parse_args()
 
-    analyze("python (upstream)", args.python_dir, args.half_day, args.known_subs_python)
-    analyze("rust", args.rust_dir, args.half_day, args.known_subs_rust)
+    groups = dict(TYPE_GROUPS, all_pairs=PAIR_TYPES)
+    if args.only_group:
+        groups = {args.only_group: groups[args.only_group]}
+
+    analyze("python (upstream)", args.python_dir, args.half_day, args.known_subs_python, groups)
+    analyze("rust", args.rust_dir, args.half_day, args.known_subs_rust, groups)
 
 
 if __name__ == "__main__":
