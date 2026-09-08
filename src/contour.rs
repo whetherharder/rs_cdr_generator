@@ -107,26 +107,64 @@ pub struct CellItemCfg {
 #[derive(Debug, Deserialize)]
 pub struct SubscribersSection {
     pub total_count: usize,
-    // Полная схема профиля (daily_rates, hourly_weights, mobility и т.п.)
-    // используется генерацией событий по времени суток — вне области
-    // этапов 1-2 (формат вывода и чтение состава/топологии). Читаем
-    // список как непрозрачный YAML, чтобы не падать на нём, но
-    // возвращаем количество и имена для проверки критерия готовности.
+    // Интенсивности трафика (daily_rates.*.params.lambda) и веса профилей
+    // читаем типизированно — они напрямую управляют объёмом и структурой
+    // трафика (см. ProfileCfg ниже). hourly_weights/day_of_week_multipliers/
+    // mobility остаются непрозрачным YAML внутри ProfileCfg (`_rest`) —
+    // распределение по часам суток в эту правку не входит, применяются
+    // только суточные интенсивности и веса профилей.
     #[serde(default)]
-    pub profiles: Vec<serde_yaml::Value>,
+    pub profiles: Vec<ProfileCfg>,
     // imsi_prefix/msisdn_prefix/contact_book/external_numbers — вне области.
     #[serde(flatten)]
     pub _rest: HashMap<String, serde_yaml::Value>,
 }
 
 impl SubscribersSection {
-    /// Имена профилей — только для контрольного вывода (см. main.rs),
-    /// полную схему профиля не парсим (см. комментарий у поля `profiles`).
+    /// Имена профилей — для контрольного вывода (см. main.rs).
     pub fn profile_names(&self) -> Vec<String> {
-        self.profiles
-            .iter()
-            .filter_map(|v| v.get("name").and_then(|n| n.as_str()).map(String::from))
-            .collect()
+        self.profiles.iter().map(|p| p.name.clone()).collect()
+    }
+}
+
+/// Профиль абонента (`subscribers.profiles[]` контурного YAML) — вес
+/// профиля в популяции и суточные интенсивности (пуассоновский параметр
+/// `lambda`) по пяти типам событий, как у питона (`engine/runner.py:
+/// 172-187`, `_ProfileCache`).
+#[derive(Debug, Deserialize, Clone)]
+pub struct ProfileCfg {
+    pub name: String,
+    #[serde(default)]
+    pub weight: f64,
+    pub daily_rates: DailyRatesCfg,
+    // hourly_weights/day_of_week_multipliers/mobility/imei_tac_pool/
+    // rat_preference/description — вне области этой правки.
+    #[serde(flatten)]
+    pub _rest: HashMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DailyRatesCfg {
+    pub mo_call: RateCfg,
+    pub mo_sms: RateCfg,
+    pub data_session: RateCfg,
+    pub mt_call: RateCfg,
+    pub mt_sms: RateCfg,
+}
+
+/// `{type: poisson, params: {lambda: N}}` — тип распределения (`type`)
+/// сейчас не используется (в конфиге контура везде `poisson`, как
+/// и у rust-сэмплера `EventCountSampler`), читаем только `lambda`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RateCfg {
+    #[serde(default)]
+    pub r#type: String,
+    pub params: HashMap<String, f64>,
+}
+
+impl RateCfg {
+    pub fn lambda(&self) -> f64 {
+        self.params.get("lambda").copied().unwrap_or(0.0)
     }
 }
 

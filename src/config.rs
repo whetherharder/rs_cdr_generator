@@ -88,6 +88,28 @@ pub struct Config {
     pub contour_seed: Option<u64>,
     pub contour_time_range_start: Option<String>,
     pub contour_time_range_end: Option<String>,
+
+    // Профили абонентов (subscribers.profiles[] контурного конфига) со
+    // своими весами и суточными интенсивностями (contour::ProfileCfg,
+    // apply_contour_config). Пусто, если --config не задан или это старый
+    // плоский конфиг — тогда генератор работает единым профилем на
+    // avg_calls_per_user/avg_sms_per_user/avg_data_sessions_per_user/
+    // mo_share_call/mo_share_sms, как раньше.
+    pub subscriber_profiles: Vec<SubscriberProfile>,
+}
+
+/// Одна запись `subscribers.profiles[]` в виде, готовом к применению
+/// в generators.rs: суточная интенсивность (`lambda`) отдельно на MO/MT
+/// голос, MO/MT SMS и data — как у питона (`_ProfileCache`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriberProfile {
+    pub name: String,
+    pub weight: f64,
+    pub mo_call_lambda: f64,
+    pub mt_call_lambda: f64,
+    pub mo_sms_lambda: f64,
+    pub mt_sms_lambda: f64,
+    pub data_lambda: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +213,7 @@ impl Default for Config {
             contour_seed: None,
             contour_time_range_start: None,
             contour_time_range_end: None,
+            subscriber_profiles: Vec::new(),
         }
     }
 }
@@ -270,6 +293,58 @@ fn apply_contour_config(config: &mut Config, contour: &crate::contour::ContourCo
     let ids: Vec<String> = contour.network.elements.iter().map(|e| e.id.clone()).collect();
     if !ids.is_empty() {
         config.network_elements = ids;
+    }
+
+    // Интенсивности и веса профилей — этой правкой (были: разобраны в
+    // contour.rs, но не долетали до Config, и генератор работал на
+    // зашитых avg_calls_per_user/avg_sms_per_user/avg_data_sessions_per_user
+    // независимо от того, что написано в конфиге). Нормируем веса на
+    // сумму: контурный YAML держит их близкими к 1.0 (0.20+0.14+...), но
+    // не обязан суммироваться ровно.
+    let profiles: Vec<SubscriberProfile> = contour
+        .subscribers
+        .profiles
+        .iter()
+        .map(|p| SubscriberProfile {
+            name: p.name.clone(),
+            weight: p.weight.max(0.0),
+            mo_call_lambda: p.daily_rates.mo_call.lambda(),
+            mt_call_lambda: p.daily_rates.mt_call.lambda(),
+            mo_sms_lambda: p.daily_rates.mo_sms.lambda(),
+            mt_sms_lambda: p.daily_rates.mt_sms.lambda(),
+            data_lambda: p.daily_rates.data_session.lambda(),
+        })
+        .collect();
+    let weight_sum: f64 = profiles.iter().map(|p| p.weight).sum();
+    if !profiles.is_empty() && weight_sum > 0.0 {
+        config.subscriber_profiles = profiles
+            .into_iter()
+            .map(|mut p| {
+                p.weight /= weight_sum;
+                p
+            })
+            .collect();
+
+        // avg_calls_per_user/avg_sms_per_user/avg_data_sessions_per_user
+        // и mo_share_call/mo_share_sms остаются как средневзвешенные по
+        // профилям — используются там, где ещё нет решения по профилю
+        // конкретного абонента (совместимость со старым плоским путём);
+        // основной путь (generators.rs) выбирает профиль на абонента
+        // и берёт lambda этого профиля напрямую.
+        let avg_mo_call: f64 = config.subscriber_profiles.iter().map(|p| p.weight * p.mo_call_lambda).sum();
+        let avg_mt_call: f64 = config.subscriber_profiles.iter().map(|p| p.weight * p.mt_call_lambda).sum();
+        let avg_mo_sms: f64 = config.subscriber_profiles.iter().map(|p| p.weight * p.mo_sms_lambda).sum();
+        let avg_mt_sms: f64 = config.subscriber_profiles.iter().map(|p| p.weight * p.mt_sms_lambda).sum();
+        let avg_data: f64 = config.subscriber_profiles.iter().map(|p| p.weight * p.data_lambda).sum();
+        config.avg_calls_per_user = avg_mo_call + avg_mt_call;
+        config.avg_sms_per_user = avg_mo_sms + avg_mt_sms;
+        config.avg_data_sessions_per_user = avg_data;
+        if config.avg_calls_per_user > 0.0 {
+            config.mo_share_call = avg_mo_call / config.avg_calls_per_user;
+        }
+        if config.avg_sms_per_user > 0.0 {
+            config.mo_share_sms = avg_mo_sms / config.avg_sms_per_user;
+        }
     }
 }
 

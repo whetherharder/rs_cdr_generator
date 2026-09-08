@@ -53,19 +53,16 @@ fn assign_ne_id(msisdn: u64, network_elements: &[String]) -> String {
     network_elements[idx].clone()
 }
 
-/// event_type("CALL"/"SMS"/"DATA") + direction("MO"/"MT") + для DATA — сторона
-/// пары (sgw/pgw) → record_type CDR_FIELDS питоновского эталона
-/// (mo_call/mt_call/mo_sms/mt_sms/sgw_data/pgw_data). Rust не порождает
-/// SGW+PGW пару на одну data-сессию (models/cdr.py, data.py:
-/// _create_sgw_pgw_pair) — эмитим один pgw_data-эквивалент, это тоже
-/// зафиксировано как упрощение этапа 1 в docs/field-mapping.md.
+/// event_type("CALL"/"SMS"/"DATA") + direction("MO"/"MT") → record_type
+/// CDR_FIELDS питоновского эталона (mo_call/mt_call/mo_sms/mt_sms). DATA
+/// парой (sgw_data/pgw_data) генерирует DataGenerator::generate_pair —
+/// см. его докстринг, здесь для DATA не вызывается.
 fn cdr_record_type(event_type: &str, direction: &str) -> &'static str {
     match (event_type, direction) {
         ("CALL", "MO") => "mo_call",
         ("CALL", _) => "mt_call",
         ("SMS", "MO") => "mo_sms",
         ("SMS", _) => "mt_sms",
-        ("DATA", _) => "pgw_data",
         _ => "",
     }
 }
@@ -437,6 +434,8 @@ pub struct DataGenerator {
     rat_dist: WeightedIndex<f64>,
     apn_dist: WeightedIndex<f64>,
     network_elements: Vec<String>,
+    sgw_elements: Vec<String>,
+    pgw_elements: Vec<String>,
 }
 
 impl DataGenerator {
@@ -447,23 +446,50 @@ impl DataGenerator {
         let apn_weights = [0.8, 0.1, 0.1];
         let apn_dist = WeightedIndex::new(&apn_weights).unwrap();
 
+        // Элементы-кандидаты для SGW- и PGW-стороны пары — отбираем по
+        // подстроке id ("sgw"/"pgw"), как их называет demo-cdr.yaml
+        // (network.elements[].id: "sgw-01", "pgw-01"). Полной TAC-based
+        // топологии нет (см. assign_ne_id) — это тот же уровень упрощения,
+        // что и раньше, только теперь СТОРОНЫ пары различаются по id, а не
+        // совпадают всегда с одним и тем же элементом.
+        let sgw_elements: Vec<String> = network_elements
+            .iter()
+            .filter(|id| id.to_lowercase().contains("sgw"))
+            .cloned()
+            .collect();
+        let pgw_elements: Vec<String> = network_elements
+            .iter()
+            .filter(|id| id.to_lowercase().contains("pgw"))
+            .cloned()
+            .collect();
+
         DataGenerator {
             cells_by_rat,
             cells_all,
             rat_dist,
             apn_dist,
             network_elements,
+            sgw_elements,
+            pgw_elements,
         }
     }
 
-    pub fn generate(
-        &self,
-        event: &mut EventRow,
-        sub: &Subscriber,
-        start_local: DateTime<chrono_tz::Tz>,
-        tz_name: &'static str,
-        rng: &mut StdRng,
-    ) {
+    /// Разыгрывает объём/RAT/соту/длительность ОДИН раз на всю пару
+    /// sgw_data+pgw_data — общий вход для `fill_side`, вызываемого дважды
+    /// (по одной стороне за раз: `EventPool::acquire` отдаёт только одну
+    /// живую `&mut EventRow` за раз, второй слот пула нельзя занять, пока
+    /// первый ещё используется, поэтому пара не собирается одним вызовом
+    /// с двумя `&mut` — розыгрыш вынесен в отдельный, "чистый от событий"
+    /// шаг). Одна data-сессия → ДВЕ записи с ОДНИМ и тем же объёмом/RAT/
+    /// длительностью/таймингом — `sgw_data` и `pgw_data`, как у питона
+    /// (`generators/data.py`, `_create_sgw_pgw_pair`; demo-cdr.yaml прямо
+    /// описывает это как «одна data-сессия даёт ДВЕ записи»). Раньше rust
+    /// эмитил один `pgw_data`-эквивалент и `sgw_data` не порождался вовсе
+    /// (docs/field-mapping.md, «Одна data-запись вместо пары» — снято этой
+    /// правкой). Общий розыгрыш гарантирует точное равенство числа
+    /// sgw_data и pgw_data по построению (эталон на боевом наборе:
+    /// 7 632 306 = 7 632 306), а не совпадение «в среднем».
+    pub fn draw_session(&self, start_local: DateTime<chrono_tz::Tz>, rng: &mut StdRng) -> DataSessionDraw {
         let rat = match self.rat_dist.sample(rng) {
             0 => "WCDMA",
             1 => "LTE",
@@ -498,33 +524,86 @@ impl DataGenerator {
             rng.gen_range(10_000..100_000)
         };
 
-        let _ = tz_name;
-        let ne_id = assign_ne_id(sub.msisdn, &self.network_elements);
         let event_ts = fmt_ts_ms(to_epoch_ms(&start_local.with_timezone(&chrono::Utc)));
         let closure_ts = fmt_ts_ms(to_epoch_ms(&end_local.with_timezone(&chrono::Utc)));
 
-        // Rust не порождает пару SGW+PGW на сессию (в отличие от data.py,
-        // _create_sgw_pgw_pair) — один record_type "pgw_data" на сессию,
-        // объёмы полностью на этой стороне (docs/field-mapping.md).
-        event.record_type = cdr_record_type("DATA", "MO").to_string();
+        DataSessionDraw {
+            rat: rat.to_string(),
+            apn: apn.to_string(),
+            cell_id,
+            dur,
+            up,
+            down,
+            event_ts,
+            closure_ts,
+        }
+    }
+
+    /// Заполняет одну сторону пары (`sgw_data`/`pgw_data`) из общего
+    /// розыгрыша `draw_session` — вызывать дважды, по одному разу на
+    /// сторону, каждый раз с новым `EventRow`, полученным из пула.
+    pub fn fill_side(
+        &self,
+        event: &mut EventRow,
+        sub: &Subscriber,
+        draw: &DataSessionDraw,
+        record_type: &'static str,
+        side: DataSide,
+    ) {
+        // Элементы нужного типа id ("sgw-01"/"pgw-01") — если в конфиге их
+        // нет (id без подстроки "sgw"/"pgw"), падаем на общий список, как
+        // раньше делал assign_ne_id: пара не теряет запись, только точность
+        // выбора обслуживающего элемента.
+        let side_elements = match side {
+            DataSide::Sgw => &self.sgw_elements,
+            DataSide::Pgw => &self.pgw_elements,
+        };
+        let ne_pool: &[String] = if side_elements.is_empty() {
+            &self.network_elements
+        } else {
+            side_elements
+        };
+        let ne_id = assign_ne_id(sub.msisdn, ne_pool);
+
+        event.record_type = record_type.to_string();
         event.served_imsi = sub.imsi.to_string();
         event.served_msisdn = sub.msisdn.to_string();
         event.served_imei = sub.imei.to_string();
         event.calling_number = sub.msisdn.to_string();
-        event.event_timestamp = event_ts.clone();
-        event.duration_seconds = dur.to_string();
-        event.first_cell_id = cell_id.to_string();
-        event.last_cell_id = cell_id.to_string();
+        event.event_timestamp = draw.event_ts.clone();
+        event.duration_seconds = draw.dur.to_string();
+        event.first_cell_id = draw.cell_id.to_string();
+        event.last_cell_id = draw.cell_id.to_string();
         event.serving_ne_id = ne_id;
-        event.record_opening_time = event_ts;
-        event.record_closure_time = closure_ts;
-        // uplink = данные ОТ абонента (up), downlink = данные К абоненту (down) —
-        // как volume_uplink/volume_downlink питоновского generators/data.py.
-        event.uplink_volume_bytes = up.to_string();
-        event.downlink_volume_bytes = down.to_string();
-        event.apn = apn.to_string();
-        event.rat_type = rat.to_string();
+        event.record_opening_time = draw.event_ts.clone();
+        event.record_closure_time = draw.closure_ts.clone();
+        // uplink = данные ОТ абонента (up), downlink = данные К абоненту
+        // (down) — как volume_uplink/volume_downlink питоновского
+        // generators/data.py, общие для обеих сторон пары.
+        event.uplink_volume_bytes = draw.up.to_string();
+        event.downlink_volume_bytes = draw.down.to_string();
+        event.apn = draw.apn.clone();
+        event.rat_type = draw.rat.clone();
     }
+}
+
+/// Общий розыгрыш параметров одной data-сессии — сторона пары не входит,
+/// она различает только `record_type`/`serving_ne_id` (см. `fill_side`).
+pub struct DataSessionDraw {
+    rat: String,
+    apn: String,
+    cell_id: u32,
+    dur: i64,
+    up: u64,
+    down: u64,
+    event_ts: String,
+    closure_ts: String,
+}
+
+#[derive(Clone, Copy)]
+pub enum DataSide {
+    Sgw,
+    Pgw,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -821,13 +900,19 @@ pub fn worker_generate(
                 continue;
             }
 
-            // Acquire event from pool and populate it
-            let event = event_pool.acquire();
-            data_gen.generate(event, &sub, start_local, tz_name, &mut rng);
-
-            // Add to batch (clone because batch needs ownership)
-            batch.push(event.clone());
-            stats.data += 1;
+            // sgw_data и pgw_data одной сессии — общий розыгрыш, две
+            // заливки по одной живой &mut EventRow за раз (см. докстринг
+            // DataGenerator::draw_session). Путь не достижим через CLI
+            // (см. докстринг функции выше), правится только чтобы не
+            // разойтись с сигнатурой draw_session/fill_side.
+            let draw = data_gen.draw_session(start_local, &mut rng);
+            let sgw_event = event_pool.acquire();
+            data_gen.fill_side(sgw_event, &sub, &draw, "sgw_data", crate::generators::DataSide::Sgw);
+            batch.push(sgw_event.clone());
+            let pgw_event = event_pool.acquire();
+            data_gen.fill_side(pgw_event, &sub, &draw, "pgw_data", crate::generators::DataSide::Pgw);
+            batch.push(pgw_event.clone());
+            stats.data += 2;
 
             // Send batch if full
             if batch.is_full(cfg.batch_size_bytes) {
@@ -959,15 +1044,53 @@ pub fn worker_generate_shard(
         data: 0,
     };
 
-    // Event counts per user
-    let avg_calls = cfg.avg_calls_per_user;
-    let avg_sms = cfg.avg_sms_per_user;
-    let avg_data = cfg.avg_data_sessions_per_user;
-
-    // Pre-compute event count samplers (OPTIMIZATION #4)
-    let calls_sampler = EventCountSampler::new(avg_calls);
-    let sms_sampler = EventCountSampler::new(avg_sms);
-    let data_sampler = EventCountSampler::new(avg_data);
+    // Интенсивности из контурного конфига (subscribers.profiles[].
+    // daily_rates.*.params.lambda) — раньше разбирались в contour.rs, но
+    // не долетали до generators.rs: генератор всегда работал на
+    // avg_calls_per_user/avg_sms_per_user/avg_data_sessions_per_user
+    // (дефолты Config::default либо старый плоский ключ), контурный YAML
+    // на объём и структуру трафика не влиял. Теперь на каждого абонента
+    // выбирается профиль (взвешенно по subscribers.profiles[].weight,
+    // как у питона — сумма весов нормирована в apply_contour_config), и
+    // число событий каждого типа сэмплируется от лямбды ЭТОГО профиля,
+    // а не от общего среднего по популяции.
+    //
+    // Если контурных профилей нет (--config не задан или старый плоский
+    // конфиг) — единственный "профиль" на avg_*_per_user, поведение как
+    // до этой правки.
+    struct ProfileSamplers {
+        weight: f64,
+        calls: EventCountSampler,
+        sms: EventCountSampler,
+        data: EventCountSampler,
+    }
+    let profile_samplers: Vec<ProfileSamplers> = if cfg.subscriber_profiles.is_empty() {
+        vec![ProfileSamplers {
+            weight: 1.0,
+            calls: EventCountSampler::new(cfg.avg_calls_per_user),
+            sms: EventCountSampler::new(cfg.avg_sms_per_user),
+            data: EventCountSampler::new(cfg.avg_data_sessions_per_user),
+        }]
+    } else {
+        cfg.subscriber_profiles
+            .iter()
+            .map(|p| ProfileSamplers {
+                weight: p.weight,
+                calls: EventCountSampler::new(p.mo_call_lambda + p.mt_call_lambda),
+                sms: EventCountSampler::new(p.mo_sms_lambda + p.mt_sms_lambda),
+                data: EventCountSampler::new(p.data_lambda),
+            })
+            .collect()
+    };
+    // Веса нормированы в apply_contour_config и никогда не все нулевые
+    // (там же — падение на weight_sum <= 0.0 не создаёт этой ветки), но
+    // на пустом контурном пути (единственный профиль weight=1.0) и на
+    // случай вырожденного конфига (все веса 0) подстрахуемся минимальным
+    // положительным весом — иначе WeightedIndex::new паникует.
+    let profile_dist = WeightedIndex::new(
+        profile_samplers.iter().map(|p| p.weight.max(1e-9)),
+    )
+    .expect("веса профилей после нормировки не могут дать пустое/невалидное распределение");
 
     // Helper: sample time during the day with diurnal pattern
     let sample_time = |rng: &mut StdRng| -> DateTime<chrono_tz::Tz> {
@@ -1034,10 +1157,13 @@ pub fn worker_generate_shard(
             continue;
         }
 
-        // Sample event counts for this user (OPTIMIZATION #4)
-        let n_calls = calls_sampler.sample(&mut rng);
-        let n_sms = sms_sampler.sample(&mut rng);
-        let n_data = data_sampler.sample(&mut rng);
+        // Профиль абонента — взвешенный выбор (subscribers.profiles[].weight),
+        // затем число событий каждого типа сэмплируется от лямбды ЭТОГО
+        // профиля (см. комментарий у profile_samplers выше).
+        let profile = &profile_samplers[profile_dist.sample(&mut rng)];
+        let n_calls = profile.calls.sample(&mut rng);
+        let n_sms = profile.sms.sample(&mut rng);
+        let n_data = profile.data.sample(&mut rng);
 
         // Generate CALL events
         for _ in 0..n_calls {
@@ -1181,17 +1307,26 @@ pub fn worker_generate_shard(
             flush_if_full!(idx);
         }
 
-        // Generate DATA events
+        // Generate DATA events — sgw_data + pgw_data одной сессии, общий
+        // розыгрыш (DataGenerator::draw_session), см. его докстринг: это
+        // и даёт точное равенство числа sgw_data/pgw_data по построению.
         for _ in 0..n_data {
             let start_local = sample_time(&mut rng);
+            let draw = data_gen.draw_session(start_local, &mut rng);
 
-            let event = event_pool.acquire();
-            data_gen.generate(event, sub, start_local, tz_name, &mut rng);
-
-            let idx = route_writer_idx(sub.msisdn);
-            batches[idx].push(event.clone());
+            let sgw_event = event_pool.acquire();
+            data_gen.fill_side(sgw_event, sub, &draw, "sgw_data", DataSide::Sgw);
+            let sgw_idx = route_writer_idx(sub.msisdn);
+            batches[sgw_idx].push(sgw_event.clone());
             stats.data += 1;
-            flush_if_full!(idx);
+            flush_if_full!(sgw_idx);
+
+            let pgw_event = event_pool.acquire();
+            data_gen.fill_side(pgw_event, sub, &draw, "pgw_data", DataSide::Pgw);
+            let pgw_idx = route_writer_idx(sub.msisdn);
+            batches[pgw_idx].push(pgw_event.clone());
+            stats.data += 1;
+            flush_if_full!(pgw_idx);
         }
     }
 
