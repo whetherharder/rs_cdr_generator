@@ -425,6 +425,69 @@ impl SmsGenerator {
         event.serving_ne_id = ne_id;
         let _ = (cause, sms_segments, sms_status); // деталей SMS в CDR_FIELDS нет — docs/field-mapping.md
     }
+
+    /// Та же запись, что и `generate`, но направление задано вызывающим,
+    /// а не разыграно по `p_mo` — нужна для пары MO(от sub)+коррелированный
+    /// MT(собеседнику), как у `CallGenerator::generate_forced_direction`.
+    /// Без неё SMS в `worker_generate_shard` эмитил РОВНО одну запись на
+    /// событие (либо MO, либо MT по монетке `p_mo`), а не пару, как звонок
+    /// (`mo_call`+коррелированный `mt_call`) — SMS давал в ~2 раза меньше
+    /// записей на единицу lambda, чем голос, и доля SMS проседала (см.
+    /// docs/contact-graph-and-memory-2026-09-08.md, задача 1).
+    pub fn generate_forced_direction(
+        &self,
+        event: &mut EventRow,
+        sub: &Subscriber,
+        start_local: DateTime<chrono_tz::Tz>,
+        other_msisdn: u64,
+        tz_name: &'static str,
+        cell_id: u32,
+        rng: &mut StdRng,
+        forced_direction: &'static str,
+    ) {
+        let direction = forced_direction;
+
+        let (msisdn_src, msisdn_dst) = if direction == "MO" {
+            (sub.msisdn, other_msisdn)
+        } else {
+            (other_msisdn, sub.msisdn)
+        };
+
+        let dur = rng.gen_range(1..=5);
+        let end_local = start_local + Duration::seconds(dur);
+
+        let sms_status = match self.status_dist.sample(rng) {
+            0 => "SENT",
+            1 => "DELIVERED",
+            _ => "FAILED",
+        };
+
+        let cause = if sms_status == "FAILED" {
+            "deliveryFailure"
+        } else {
+            "deliverySuccess"
+        };
+
+        let sms_segments = match self.segments_dist.sample(rng) {
+            0 => 1,
+            1 => 2,
+            _ => 3,
+        };
+
+        let ne_id = assign_ne_id(sub.msisdn, &self.network_elements);
+        event.record_type = cdr_record_type("SMS", direction).to_string();
+        event.served_imsi = sub.imsi.to_string();
+        event.served_msisdn = sub.msisdn.to_string();
+        event.served_imei = sub.imei.to_string();
+        event.calling_number = msisdn_src.to_string();
+        event.called_number = msisdn_dst.to_string();
+        event.event_timestamp = fmt_ts_ms(to_epoch_ms(&start_local.with_timezone(&chrono::Utc)));
+        event.duration_seconds = dur.to_string();
+        event.first_cell_id = cell_id.to_string();
+        event.last_cell_id = cell_id.to_string();
+        event.serving_ne_id = ne_id;
+        let _ = (cause, sms_segments, sms_status, end_local, tz_name);
+    }
 }
 
 /// Generate DATA session events
@@ -1076,8 +1139,16 @@ pub fn worker_generate_shard(
             .iter()
             .map(|p| ProfileSamplers {
                 weight: p.weight,
-                calls: EventCountSampler::new(p.mo_call_lambda + p.mt_call_lambda),
-                sms: EventCountSampler::new(p.mo_sms_lambda + p.mt_sms_lambda),
+                // Только mo_*_lambda: у питона (engine/runner.py, _ProfileCache)
+                // mt_call/mt_sms lambda из конфига не читаются вовсе — MT-запись
+                // не независимое событие, а корреляция ответа на чей-то MO (ниже
+                // по циклу, generate correlated MT). Суммирование mo+mt здесь было
+                // ошибкой: каждый абонент получал вдвое больше исходящих попыток,
+                // чем задано лямбдой mo_call/mo_sms, и голос/SMS перелетали питона
+                // (54.1%/15.2% при 39.5%/20.3% у питона, см. docs/contact-graph-
+                // and-memory-2026-09-08.md).
+                calls: EventCountSampler::new(p.mo_call_lambda),
+                sms: EventCountSampler::new(p.mo_sms_lambda),
                 data: EventCountSampler::new(p.data_lambda),
             })
             .collect()
@@ -1298,13 +1369,54 @@ pub fn worker_generate_shard(
 
             let cell_id = rng.gen_range(10_000..100_000);
 
-            let event = event_pool.acquire();
-            sms_gen.generate(event, sub, start_local, other_msisdn, tz_name, cell_id, &mut rng);
-
-            let idx = route_writer_idx(sub.msisdn);
-            batches[idx].push(event.clone());
+            // MO от sub + коррелированный MT собеседнику — та же схема, что
+            // у CALL выше (`generate_forced_direction`, а не разыгранный
+            // `p_mo`): n_sms — это отправленные sub'ом сообщения (лямбда
+            // mo_sms профиля), MT — не независимое событие, а ответ сети
+            // получателю, как у питона (generators/sms.py: MO+MT парой на
+            // одно сообщение).
+            let mo_event = event_pool.acquire();
+            sms_gen.generate_forced_direction(
+                mo_event, sub, start_local, other_msisdn, tz_name, cell_id, &mut rng, "MO",
+            );
+            let mo_idx = route_writer_idx(sub.msisdn);
+            batches[mo_idx].push(mo_event.clone());
             stats.sms += 1;
-            flush_if_full!(idx);
+            flush_if_full!(mo_idx);
+
+            let other_snapshot_opt = if let Some(snapshots) = snapshot_cache.get(&other_msisdn) {
+                crate::subscriber_db_redb::SubscriberDbRedb::find_snapshot_at(snapshots, day_start_ts).cloned()
+            } else {
+                redb.get_subscriber_at(other_msisdn, day_start_ts)?
+            };
+
+            if let Some(ref other_snapshot) = other_snapshot_opt {
+                if other_snapshot.msisdn != 0 {
+                    // served_* — получатель (other_snapshot), а не sub: MT-
+                    // запись видна с коммутатора получателя, ровно как у
+                    // коррелированного mt_call выше. calling/called не
+                    // разворачиваются — та же ориентация, что у MO.
+                    let event_timestamp = mo_event.event_timestamp.clone();
+                    let duration_seconds = mo_event.duration_seconds.clone();
+                    let mt_event = event_pool.acquire();
+                    mt_event.record_type = cdr_record_type("SMS", "MT").to_string();
+                    mt_event.served_imsi = other_snapshot.imsi.to_string();
+                    mt_event.served_msisdn = other_snapshot.msisdn.to_string();
+                    mt_event.served_imei = other_snapshot.imei.to_string();
+                    mt_event.calling_number = sub.msisdn.to_string();
+                    mt_event.called_number = other_msisdn.to_string();
+                    mt_event.event_timestamp = event_timestamp;
+                    mt_event.duration_seconds = duration_seconds;
+                    mt_event.first_cell_id = cell_id.to_string();
+                    mt_event.last_cell_id = cell_id.to_string();
+                    mt_event.serving_ne_id = assign_ne_id(other_snapshot.msisdn, &cfg.network_elements);
+
+                    let mt_idx = route_writer_idx(other_snapshot.msisdn);
+                    batches[mt_idx].push(mt_event.clone());
+                    stats.sms += 1;
+                    flush_if_full!(mt_idx);
+                }
+            }
         }
 
         // Generate DATA events — sgw_data + pgw_data одной сессии, общий
