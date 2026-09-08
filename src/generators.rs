@@ -67,6 +67,16 @@ fn cdr_record_type(event_type: &str, direction: &str) -> &'static str {
     }
 }
 
+/// 32-hex-символьный случайный идентификатор — как у питона
+/// (`voice.py`/`sms.py`, `bytes(rng.integers(0, 256, size=16)).hex()`):
+/// это не смоделированные данные, а просто случайная метка корреляции
+/// MO/MT одной попытки вызова/SMS, поэтому воспроизвести её как случайную
+/// строку — не значит «придумать значение» (docs/field-mapping.md).
+fn gen_correlation_id(rng: &mut StdRng) -> String {
+    let bytes: [u8; 16] = rng.gen();
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 /// ISO-8601 с миллисекундами и суффиксом Z — тот же формат, что питоновский
 /// _fmt_dt в models/cdr.py (isoformat(timespec="milliseconds") + "Z").
 fn fmt_ts_ms(epoch_ms: i64) -> String {
@@ -333,6 +343,7 @@ impl CallGenerator {
 
         let end_local = start_local + Duration::seconds(dur_sec);
         let ne_id = assign_ne_id(sub.msisdn, &self.network_elements);
+        let is_answered = dispo.as_str() == "ANSWERED";
 
         event.record_type = cdr_record_type("CALL", direction).to_string();
         event.served_imsi = sub.imsi.to_string();
@@ -341,13 +352,26 @@ impl CallGenerator {
         event.calling_number = msisdn_src.to_string();
         event.called_number = msisdn_dst.to_string();
         event.event_timestamp = fmt_ts_ms(to_epoch_ms(&start_local.with_timezone(&chrono::Utc)));
+        // answer_timestamp — по правилу питона (voice.py, _generate_successful_call):
+        // фиксированная 1 секунда от начала события, только для ANSWERED
+        // (у failed-звонка питон это поле вовсе не заполняет).
+        event.answer_timestamp = if is_answered {
+            fmt_ts_ms(to_epoch_ms(&(start_local + Duration::seconds(1)).with_timezone(&chrono::Utc)))
+        } else {
+            String::new()
+        };
         event.release_timestamp = fmt_ts_ms(to_epoch_ms(&end_local.with_timezone(&chrono::Utc)));
         event.duration_seconds = dur_sec.to_string();
         event.first_cell_id = cell_id.to_string();
         event.last_cell_id = cell_id.to_string();
         event.serving_ne_id = ne_id;
+        // consolidation_id — случайная метка корреляции MO/MT одной попытки
+        // вызова, как у питона (voice.py, `_buf.get_uuid()`/`rng.integers`);
+        // вызывающий код (worker_generate_shard) копирует то же значение
+        // в парную MT-запись.
+        event.consolidation_id = gen_correlation_id(rng);
         let _ = cause; // числовой cause_for_termination не заводим — docs/field-mapping.md
-        dispo.as_str() == "ANSWERED"
+        is_answered
     }
 }
 
@@ -504,6 +528,10 @@ impl SmsGenerator {
         event.first_cell_id = cell_id.to_string();
         event.last_cell_id = cell_id.to_string();
         event.serving_ne_id = ne_id;
+        // consolidation_id — как у CallGenerator::generate_forced_direction:
+        // случайная метка корреляции MO/MT одной SMS, тот же приём, что
+        // и у питона (sms.py, `_buf.get_uuid()`).
+        event.consolidation_id = gen_correlation_id(rng);
         let _ = (cause, sms_segments, sms_status, end_local, tz_name);
     }
 }
@@ -646,6 +674,12 @@ impl DataGenerator {
         let event_ts = fmt_ts_ms(to_epoch_ms(&start_local.with_timezone(&chrono::Utc)));
         let closure_ts = fmt_ts_ms(to_epoch_ms(&end_local.with_timezone(&chrono::Utc)));
 
+        // charging_id — как у питона (`generators/data.py`,
+        // `rng.integers(1, 2**31)`): случайный ID сессии, общий у sgw_data
+        // и pgw_data одной пары (там это буквально то же поле, которым
+        // потребитель склеивает partial records одной сессии).
+        let charging_id: u32 = rng.gen_range(1..=2_147_483_647u32);
+
         DataSessionDraw {
             rat: rat.to_string(),
             apn: apn.to_string(),
@@ -655,6 +689,7 @@ impl DataGenerator {
             down,
             event_ts,
             closure_ts,
+            charging_id,
         }
     }
 
@@ -703,6 +738,7 @@ impl DataGenerator {
         event.downlink_volume_bytes = draw.down.to_string();
         event.apn = draw.apn.clone();
         event.rat_type = draw.rat.clone();
+        event.charging_id = draw.charging_id.to_string();
     }
 }
 
@@ -717,6 +753,7 @@ pub struct DataSessionDraw {
     down: u64,
     event_ts: String,
     closure_ts: String,
+    charging_id: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -1435,8 +1472,10 @@ pub fn worker_generate_shard(
 
                 // Save parameters for MT correlation
                 let event_timestamp = mo_event.event_timestamp.clone();
+                let answer_timestamp = mo_event.answer_timestamp.clone();
                 let release_timestamp = mo_event.release_timestamp.clone();
                 let duration_seconds = mo_event.duration_seconds.clone();
+                let consolidation_id = mo_event.consolidation_id.clone();
 
                 // Generate correlated MT record
                 let mt_event = event_pool.acquire();
@@ -1444,6 +1483,7 @@ pub fn worker_generate_shard(
                 mt_event.served_imsi = other_snapshot.imsi.to_string();
                 mt_event.served_msisdn = other_snapshot.msisdn.to_string();
                 mt_event.served_imei = other_snapshot.imei.to_string();
+                mt_event.consolidation_id = consolidation_id;
                 // Направление MT-записи — то же, что у MO (calling=инициатор
                 // звонка, called=собеседник), а не развёрнутое: это одна и
                 // та же попытка звонка, увиденная с двух коммутаторов, а не
@@ -1456,6 +1496,7 @@ pub fn worker_generate_shard(
                 mt_event.calling_number = sub.msisdn.to_string();
                 mt_event.called_number = other_msisdn.to_string();
                 mt_event.event_timestamp = event_timestamp;
+                mt_event.answer_timestamp = answer_timestamp;
                 mt_event.release_timestamp = release_timestamp;
                 mt_event.duration_seconds = duration_seconds;
                 mt_event.first_cell_id = cell_id.to_string();
@@ -1474,17 +1515,21 @@ pub fn worker_generate_shard(
                 // известны (это не наша сеть) — пусто, как остальные
                 // немоделируемые поля (docs/field-mapping.md).
                 let event_timestamp = mo_event.event_timestamp.clone();
+                let answer_timestamp = mo_event.answer_timestamp.clone();
                 let release_timestamp = mo_event.release_timestamp.clone();
                 let duration_seconds = mo_event.duration_seconds.clone();
+                let consolidation_id = mo_event.consolidation_id.clone();
 
                 let mt_event = event_pool.acquire();
                 mt_event.record_type = cdr_record_type("CALL", "MT").to_string();
                 mt_event.served_imsi = String::new();
                 mt_event.served_msisdn = other_msisdn.to_string();
                 mt_event.served_imei = String::new();
+                mt_event.consolidation_id = consolidation_id;
                 mt_event.calling_number = sub.msisdn.to_string();
                 mt_event.called_number = other_msisdn.to_string();
                 mt_event.event_timestamp = event_timestamp;
+                mt_event.answer_timestamp = answer_timestamp;
                 mt_event.release_timestamp = release_timestamp;
                 mt_event.duration_seconds = duration_seconds;
                 mt_event.first_cell_id = cell_id.to_string();
@@ -1556,11 +1601,13 @@ pub fn worker_generate_shard(
                     // разворачиваются — та же ориентация, что у MO.
                     let event_timestamp = mo_event.event_timestamp.clone();
                     let duration_seconds = mo_event.duration_seconds.clone();
+                    let consolidation_id = mo_event.consolidation_id.clone();
                     let mt_event = event_pool.acquire();
                     mt_event.record_type = cdr_record_type("SMS", "MT").to_string();
                     mt_event.served_imsi = other_snapshot.imsi.to_string();
                     mt_event.served_msisdn = other_snapshot.msisdn.to_string();
                     mt_event.served_imei = other_snapshot.imei.to_string();
+                    mt_event.consolidation_id = consolidation_id;
                     mt_event.calling_number = sub.msisdn.to_string();
                     mt_event.called_number = other_msisdn.to_string();
                     mt_event.event_timestamp = event_timestamp;
@@ -1579,11 +1626,13 @@ pub fn worker_generate_shard(
                 // в redb, MT молча не создавался — то же исправление.
                 let event_timestamp = mo_event.event_timestamp.clone();
                 let duration_seconds = mo_event.duration_seconds.clone();
+                let consolidation_id = mo_event.consolidation_id.clone();
                 let mt_event = event_pool.acquire();
                 mt_event.record_type = cdr_record_type("SMS", "MT").to_string();
                 mt_event.served_imsi = String::new();
                 mt_event.served_msisdn = other_msisdn.to_string();
                 mt_event.served_imei = String::new();
+                mt_event.consolidation_id = consolidation_id;
                 mt_event.calling_number = sub.msisdn.to_string();
                 mt_event.called_number = other_msisdn.to_string();
                 mt_event.event_timestamp = event_timestamp;

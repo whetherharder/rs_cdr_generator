@@ -14,20 +14,20 @@
 | Колонка CDR_FIELDS       | Источник в rust                                            | Примечание |
 |---------------------------|-------------------------------------------------------------|------------|
 | `record_type`              | `cdr_record_type(event_type, direction)`                    | `mo_call`/`mt_call`/`mo_sms`/`mt_sms`/`pgw_data` — см. «Одна data-запись вместо пары» ниже |
-| `sequence_number`          | пусто                                                        | в rust не ведётся |
-| `consolidation_id`         | пусто                                                        | в rust не ведётся |
-| `charging_id`               | пусто                                                        | в rust не ведётся |
+| `sequence_number`          | пусто                                                        | в rust не ведётся; **у питона на `demo-cdr.yaml` тоже всегда пусто** (поле модели не заполняется генератором) — не расхождение |
+| `consolidation_id`         | случайный 32-hex `gen_correlation_id`, общий у MO/MT (CALL и SMS) | как у питона (`voice.py`/`sms.py`, `bytes(rng.integers(0,256,size=16)).hex()`) — метка корреляции, не смоделированные данные |
+| `charging_id`               | случайный `u32` (1..2^31), общий у `sgw_data`/`pgw_data` одной сессии | как у питона (`generators/data.py`, `rng.integers(1, 2**31)`) |
 | `served_imsi`               | `sub.imsi`                                                   | |
 | `served_msisdn`             | `sub.msisdn`                                                 | собственный номер абонента, не участник вызова |
 | `served_imei`               | `sub.imei`                                                   | |
 | `calling_number`            | `msisdn_src` (CALL/SMS) / `sub.msisdn` (DATA)                | |
 | `called_number`             | `msisdn_dst` (CALL/SMS)                                      | у DATA пусто — второй стороны нет |
-| `redirecting_number`        | пусто                                                        | переадресация в rust не смоделирована (как и в demo-cdr.yaml, `call_forwarding_rate: 0.0`) |
+| `redirecting_number`        | пусто                                                        | переадресация в rust не смоделирована (как и в demo-cdr.yaml, `call_forwarding_rate: 0.0`) — у питона на этом конфиге тоже пусто |
 | `event_timestamp`           | начало события, ISO-8601 мс + `Z`                            | формат `fmt_ts_ms`, совпадает с питоновским `_fmt_dt` |
-| `answer_timestamp`          | пусто                                                        | момент ответа отдельно не моделируется (только суммарная длительность) |
+| `answer_timestamp`          | `event_timestamp + 1с`, только у ANSWERED CALL               | по правилу питона (`voice.py::_generate_successful_call`, фиксированная 1 секунда до ответа); у неотвеченного звонка, SMS и DATA — пусто, как у питона |
 | `release_timestamp`         | конец события (только CALL)                                 | у SMS/DATA не заполняется в питоне не для этого поля — используется `record_closure_time` |
 | `duration_seconds`          | `duration_sec`/`dur`                                         | |
-| `cause_for_termination`     | пусто                                                        | у питона это числовой код (voice.py `normal_termination_causes`), у rust — только текстовая причина (`cause_for_record_closing`); числового кода не изобретаем |
+| `cause_for_termination`     | пусто                                                        | у питона это числовой код из `events.voice.normal_termination_causes`/`failure_causes` (`demo-cdr.yaml`); rust вычисляет текстовую причину (`cause_for_record_closing`), но конфигом эти списки кодов не читает — не заводим свою нумерацию, чтобы не изобретать соответствие; осталось долгом |
 | `first_cell_id`             | `cell_id`                                                    | |
 | `last_cell_id`               | `cell_id`                                                    | хендовер в rust не моделируется, поэтому всегда совпадает с first_cell_id |
 | `serving_ne_id`              | `assign_ne_id(sub.msisdn, network_elements)`                 | см. «serving_ne_id» ниже |
@@ -36,12 +36,44 @@
 | `uplink_volume_bytes`        | `data_bytes_in` = «up» (только DATA)                         | данные ОТ абонента |
 | `downlink_volume_bytes`      | `data_bytes_out` = «down» (только DATA)                      | данные К абоненту |
 | `apn`                        | `apn` (только DATA)                                          | |
-| `qci`                        | пусто                                                        | QCI в rust не моделируется |
+| `qci`                        | пусто                                                        | у питона на `demo-cdr.yaml` фиксированно 9 (`events.data.qos_distribution`, единственная запись, weight 1.0); rust это распределение не читает — осталось долгом |
 | `rat_type`                   | `rat` (только DATA)                                          | у CALL/SMS RAT не выбирается — пусто |
-| `vendor_extensions`          | пусто                                                        | как и в demo-cdr.yaml (`vendor_extensions: {}`) |
+| `vendor_extensions`          | пусто                                                        | как и в demo-cdr.yaml (`vendor_extensions: {}`) — у питона на этом конфиге тоже пусто |
 
 Правило по умолчанию: где данных нет — пустая строка, а не выдуманное
 правдоподобное значение. Все такие поля перечислены в таблице выше.
+
+## Измерение пустых колонок (2026-09-08, третья правка)
+
+Из исходных 8 колонок, которые оставались пустыми в rust
+(`sequence_number`, `consolidation_id`, `charging_id`,
+`redirecting_number`, `answer_timestamp`, `cause_for_termination`,
+`qci`, `vendor_extensions`), измерение на питоновском образце
+(300 абонентов, 3 суток, `demo-cdr.yaml`, 12 682 записи) дало разбивку
+по доле в байтах значений колонок:
+
+| Колонка | Доля от суммы байт всех значений (питон) | Заполнено в этой правке |
+|---|---:|---|
+| `consolidation_id` | 11.51% | да |
+| `answer_timestamp` | 5.56% | да |
+| `charging_id` | 2.09% | да |
+| `cause_for_termination` | 0.51% | нет — нет источника числового кода без изобретения |
+| `qci` | 0.22% | нет — конфиг не читается |
+| `sequence_number` | 0.00% | не нужно — у питона тоже пусто на этом конфиге |
+| `redirecting_number` | 0.00% | не нужно — у питона тоже пусто (`call_forwarding_rate: 0.0`) |
+| `vendor_extensions` | 0.00% | не нужно — у питона тоже пусто (`vendor_extensions: {}`) |
+
+Итого 8 колонок объясняли **19.89%** доли байт значений (без учёта
+постоянных разделителей CSV, одинаковых у обеих версий). Прямая проверка
+компрессией: обнуление тех же 8 колонок в питоновском CSV-образце и
+повторный `gzip` (уровень 6) дали **31.66%** сокращения сжатого объёма —
+**больше**, чем измеренный разрыв rust/питон в 28.1% на боевом наборе,
+то есть 8 колонок с запасом объясняют весь разрыв целиком, искать другую
+причину не нужно. Разница между 19.89% (доля сырых байт значений) и
+31.66% (доля сжатого объёма) — из-за `consolidation_id`: это
+высокоэнтропийная случайная строка (32 hex-символа), она почти не
+сжимается gzip и поэтому даёт непропорционально большой вклад в сжатый
+объём относительно своей доли в сыром тексте.
 
 ## serving_ne_id — упрощение относительно эталона
 
