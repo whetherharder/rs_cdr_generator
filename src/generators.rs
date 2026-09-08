@@ -280,7 +280,14 @@ impl CallGenerator {
     }
 
     /// Generate call event with forced direction (for MO↔MT correlation)
-    /// This allows explicit MO or MT record generation
+    /// This allows explicit MO or MT record generation.
+    ///
+    /// Возвращает `true`, если сэмплированная диспозиция — `ANSWERED`
+    /// (вызов состоялся). Вызывающий код обязан использовать это значение,
+    /// чтобы решить, порождать ли MT-запись: у питона несостоявшийся вызов
+    /// (`success_rate`) даёт только MO-запись без пары (`voice.py`,
+    /// `_generate_failed_call` возвращает список из одной записи) — иначе
+    /// `success_rate` из конфига не влияет на соотношение mt_call/mo_call.
     pub fn generate_forced_direction(
         &self,
         event: &mut EventRow,
@@ -291,7 +298,7 @@ impl CallGenerator {
         cell_id: u32,
         rng: &mut StdRng,
         forced_direction: &'static str,  // "MO" or "MT"
-    ) {
+    ) -> bool {
         let direction = forced_direction;
 
         let (msisdn_src, msisdn_dst) = if direction == "MO" {
@@ -340,6 +347,7 @@ impl CallGenerator {
         event.last_cell_id = cell_id.to_string();
         event.serving_ne_id = ne_id;
         let _ = cause; // числовой cause_for_termination не заводим — docs/field-mapping.md
+        dispo.as_str() == "ANSWERED"
     }
 }
 
@@ -909,7 +917,10 @@ pub fn worker_generate(
 
             // Generate MO (Mobile Originated) record for current subscriber
             let mo_event = event_pool.acquire();
-            call_gen.generate_forced_direction(mo_event, &sub, start_local, other_msisdn, tz_name, cell_id, &mut rng, "MO");
+            // Функция dead-code (worker_generate не вызывается из main.rs,
+            // см. worker_generate_shard ниже) — success_rate/MT-гейт здесь
+            // намеренно не применяем, чтобы не трогать неиспользуемый путь.
+            let _ = call_gen.generate_forced_direction(mo_event, &sub, start_local, other_msisdn, tz_name, cell_id, &mut rng, "MO");
 
             // Add MO record to batch
             batch.push(mo_event.clone());
@@ -1380,7 +1391,15 @@ pub fn worker_generate_shard(
 
             // Generate MO record
             let mo_event = event_pool.acquire();
-            call_gen.generate_forced_direction(
+            // Возврат — сэмплированная диспозиция ANSWERED/не-ANSWERED
+            // (success_rate из events.voice.success_rate, config.rs). MO
+            // пишется всегда — это попытка вызова, видна коммутатору
+            // вызывающего независимо от исхода (как у питона,
+            // `voice.py::_generate_failed_call` тоже возвращает MO). MT
+            // порождаем только при ANSWERED — иначе несостоявшийся вызов
+            // всё равно давал бы пару MO/MT и success_rate не влиял бы
+            // на соотношение mt_call/mo_call (было 0.989 вместо ~0.85).
+            let is_answered = call_gen.generate_forced_direction(
                 mo_event,
                 sub,
                 start_local,
@@ -1395,6 +1414,10 @@ pub fn worker_generate_shard(
             batches[mo_idx].push(mo_event.clone());
             stats.calls += 1;
             flush_if_full!(mo_idx);
+
+            if !is_answered {
+                continue;
+            }
 
             // Check if other party is in database for MT generation
             // First check cache, fallback to DB for out-of-chunk MSISDNs (OPTIMIZATION #1)
