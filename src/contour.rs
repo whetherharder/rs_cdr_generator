@@ -174,12 +174,13 @@ pub struct CellItemCfg {
 #[derive(Debug, Deserialize)]
 pub struct SubscribersSection {
     pub total_count: usize,
-    // Интенсивности трафика (daily_rates.*.params.lambda) и веса профилей
-    // читаем типизированно — они напрямую управляют объёмом и структурой
-    // трафика (см. ProfileCfg ниже). hourly_weights/day_of_week_multipliers/
-    // mobility остаются непрозрачным YAML внутри ProfileCfg (`_rest`) —
-    // распределение по часам суток в эту правку не входит, применяются
-    // только суточные интенсивности и веса профилей.
+    // Интенсивности трафика (daily_rates.*.params.lambda), веса профилей
+    // и day_of_week_multipliers читаем типизированно — они напрямую
+    // управляют объёмом и структурой трафика (см. ProfileCfg ниже).
+    // hourly_weights/mobility остаются непрозрачным YAML внутри ProfileCfg
+    // (`_rest`) — распределение по часам суток в эту правку не входит,
+    // применяются только суточные интенсивности, множитель дня недели
+    // и веса профилей.
     #[serde(default)]
     pub profiles: Vec<ProfileCfg>,
     // Книга контактов и пул внешних номеров — читаем типизированно (этой
@@ -274,10 +275,26 @@ pub struct ProfileCfg {
     #[serde(default)]
     pub weight: f64,
     pub daily_rates: DailyRatesCfg,
-    // hourly_weights/day_of_week_multipliers/mobility/imei_tac_pool/
-    // rat_preference/description — вне области этой правки.
+    // day_of_week_multipliers — читаем типизированно (эта правка): у питона
+    // (engine/rates.py:60-63) множитель дня недели масштабирует hourly_rate
+    // отдельно по voice/sms/data, и без него rust переоценивал долю голоса
+    // и недооценивал долю data (доказано расчётом в README).
+    #[serde(default)]
+    pub day_of_week_multipliers: Option<DayOfWeekMultipliersCfg>,
+    // hourly_weights/mobility/imei_tac_pool/rat_preference/description —
+    // вне области этой правки.
     #[serde(flatten)]
     pub _rest: HashMap<String, serde_yaml::Value>,
+}
+
+/// `subscribers.profiles[].day_of_week_multipliers` — по 7 множителей
+/// (Пн=0 … Вс=6) на каждый из трёх типов событий, как у питона
+/// (`engine/rates.py`, `dow_multipliers`).
+#[derive(Debug, Deserialize, Clone)]
+pub struct DayOfWeekMultipliersCfg {
+    pub voice: Vec<f64>,
+    pub data: Vec<f64>,
+    pub sms: Vec<f64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

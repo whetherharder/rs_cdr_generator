@@ -1261,6 +1261,11 @@ pub fn worker_generate_shard(
             data: EventCountSampler::new(cfg.avg_data_sessions_per_user),
         }]
     } else {
+        // День недели текущего шарда (Пн=0 … Вс=6, как в контурном конфиге
+        // и у питона, engine/rates.py:60-63) — множитель масштабирует
+        // суточную лямбду каждого профиля отдельно по voice/sms/data,
+        // до сэмплирования, а не после.
+        let dow_idx = day.weekday().num_days_from_monday() as usize;
         cfg.subscriber_profiles
             .iter()
             .map(|p| ProfileSamplers {
@@ -1273,9 +1278,9 @@ pub fn worker_generate_shard(
                 // чем задано лямбдой mo_call/mo_sms, и голос/SMS перелетали питона
                 // (54.1%/15.2% при 39.5%/20.3% у питона, см. docs/contact-graph-
                 // and-memory-2026-09-08.md).
-                calls: EventCountSampler::new(p.mo_call_lambda),
-                sms: EventCountSampler::new(p.mo_sms_lambda),
-                data: EventCountSampler::new(p.data_lambda),
+                calls: EventCountSampler::new(p.mo_call_lambda * p.dow_mult_voice[dow_idx]),
+                sms: EventCountSampler::new(p.mo_sms_lambda * p.dow_mult_sms[dow_idx]),
+                data: EventCountSampler::new(p.data_lambda * p.dow_mult_data[dow_idx]),
             })
             .collect()
     };

@@ -141,6 +141,22 @@ pub struct SubscriberProfile {
     pub mo_sms_lambda: f64,
     pub mt_sms_lambda: f64,
     pub data_lambda: f64,
+    // Множитель дня недели (Пн=0 … Вс=6) отдельно на голос/SMS/data — как
+    // у питона (engine/rates.py:60-63). Без day_of_week_multipliers
+    // в конфиге — [1.0; 7], поведение не меняется.
+    pub dow_mult_voice: [f64; 7],
+    pub dow_mult_sms: [f64; 7],
+    pub dow_mult_data: [f64; 7],
+}
+
+fn dow_mult_array(v: &[f64]) -> [f64; 7] {
+    let mut out = [1.0f64; 7];
+    for (i, slot) in out.iter_mut().enumerate() {
+        if let Some(x) = v.get(i) {
+            *slot = *x;
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +370,21 @@ fn apply_contour_config(config: &mut Config, contour: &crate::contour::ContourCo
             mo_sms_lambda: p.daily_rates.mo_sms.lambda(),
             mt_sms_lambda: p.daily_rates.mt_sms.lambda(),
             data_lambda: p.daily_rates.data_session.lambda(),
+            dow_mult_voice: p
+                .day_of_week_multipliers
+                .as_ref()
+                .map(|d| dow_mult_array(&d.voice))
+                .unwrap_or([1.0; 7]),
+            dow_mult_sms: p
+                .day_of_week_multipliers
+                .as_ref()
+                .map(|d| dow_mult_array(&d.sms))
+                .unwrap_or([1.0; 7]),
+            dow_mult_data: p
+                .day_of_week_multipliers
+                .as_ref()
+                .map(|d| dow_mult_array(&d.data))
+                .unwrap_or([1.0; 7]),
         })
         .collect();
     let weight_sum: f64 = profiles.iter().map(|p| p.weight).sum();
