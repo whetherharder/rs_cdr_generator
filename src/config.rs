@@ -96,6 +96,37 @@ pub struct Config {
     // avg_calls_per_user/avg_sms_per_user/avg_data_sessions_per_user/
     // mo_share_call/mo_share_sms, как раньше.
     pub subscriber_profiles: Vec<SubscriberProfile>,
+
+    // Параметры книги контактов (subscribers.contact_book контурного
+    // конфига) — этой правкой заменяют константы contact_book.rs
+    // (ZIPF_A/MIN_DEGREE/MAX_DEGREE/EXTERNAL_CALL_RATIO/
+    // REPEAT_CALL_PROBABILITY), которые были зашиты независимо от того,
+    // что написано в конфиге (EXTERNAL_CALL_RATIO=0.15 в коде против 0.12
+    // в demo-cdr.yaml). None — конфиг не задал секцию, используем прежние
+    // дефолты (contact_book::{ZIPF_A, MIN_DEGREE, ...}).
+    pub contact_book_zipf_a: Option<f64>,
+    pub contact_book_min_degree: Option<usize>,
+    pub contact_book_max_degree: Option<usize>,
+    pub contact_book_external_call_ratio: Option<f64>,
+    pub contact_book_repeat_call_probability: Option<f64>,
+
+    // Пул внешних номеров (subscribers.external_numbers.prefixes) со
+    // своими весами. Пусто — используется прежний равновероятный список
+    // числовых префиксов (main.rs).
+    pub external_number_prefixes: Vec<(u64, f64)>, // (числовой префикс, вес)
+
+    // events.voice.success_rate / events.sms.delivery_success_rate —
+    // доля успешных звонков/доставленных SMS. None — используются
+    // прежние зашитые доли (call_dispositions по умолчанию, sms всегда
+    // "SENT"/"DELIVERED"/"FAILED" по фиксированным весам).
+    pub voice_success_rate: Option<f64>,
+    pub sms_delivery_success_rate: Option<f64>,
+
+    // events.data.volume_uplink/volume_downlink (lognormal mu/sigma/
+    // min_bytes) — None означает «конфиг не задал этого», используется
+    // прежняя зашитая по-RAT таблица в generators.rs::DataGenerator.
+    pub data_volume_uplink: Option<(f64, f64, f64)>,   // (mu, sigma, min_bytes)
+    pub data_volume_downlink: Option<(f64, f64, f64)>,
 }
 
 /// Одна запись `subscribers.profiles[]` в виде, готовом к применению
@@ -214,6 +245,16 @@ impl Default for Config {
             contour_time_range_start: None,
             contour_time_range_end: None,
             subscriber_profiles: Vec::new(),
+            contact_book_zipf_a: None,
+            contact_book_min_degree: None,
+            contact_book_max_degree: None,
+            contact_book_external_call_ratio: None,
+            contact_book_repeat_call_probability: None,
+            external_number_prefixes: Vec::new(),
+            voice_success_rate: None,
+            sms_delivery_success_rate: None,
+            data_volume_uplink: None,
+            data_volume_downlink: None,
         }
     }
 }
@@ -344,6 +385,67 @@ fn apply_contour_config(config: &mut Config, contour: &crate::contour::ContourCo
         }
         if config.avg_sms_per_user > 0.0 {
             config.mo_share_sms = avg_mo_sms / config.avg_sms_per_user;
+        }
+    }
+
+    // Книга контактов: параметры конфига заменяют константы contact_book.rs
+    // (main.rs передаёт их в ContactBook::build/CONTACT_THRESHOLD).
+    if let Some(cb) = &contour.subscribers.contact_book {
+        config.contact_book_zipf_a = Some(cb.degree_distribution.params.a);
+        config.contact_book_min_degree = Some(cb.degree_distribution.params.min.max(1));
+        config.contact_book_max_degree = Some(cb.degree_distribution.params.max.max(1));
+        config.contact_book_external_call_ratio = Some(cb.external_call_ratio);
+        config.contact_book_repeat_call_probability = Some(cb.repeat_call_probability);
+    }
+
+    // Пул внешних номеров: числовой префикс = цифры после "+", как их
+    // собирает main.rs (numeric_prefixes) — только вес меняется, схема
+    // сборки самого номера (prefix*10_000_000 + случайные 7 цифр) та же.
+    if let Some(ext) = &contour.subscribers.external_numbers {
+        config.external_number_prefixes = ext
+            .prefixes
+            .iter()
+            .filter_map(|p| {
+                let digits: String = p.prefix.chars().filter(|c| c.is_ascii_digit()).collect();
+                digits.parse::<u64>().ok().map(|n| (n, p.weight.max(0.0)))
+            })
+            .collect();
+    }
+
+    // events.voice.success_rate — доля ANSWERED. Остаток (1 - success_rate)
+    // распределяется между NO ANSWER/BUSY/FAILED/CONGESTION в тех же
+    // относительных пропорциях, что были у дефолта (0.12:0.04:0.015:0.005 —
+    // ANSWERED вынесена из суммы), а не подгоняется под питоновские числа.
+    if let Some(events) = &contour.events {
+        if let Some(voice) = &events.voice {
+            config.voice_success_rate = Some(voice.success_rate);
+            let sr = voice.success_rate.clamp(0.0, 1.0);
+            let fail_share = 1.0 - sr;
+            // Относительные веса неуспеха дефолта: 0.12, 0.04, 0.015, 0.005
+            // (сумма 0.18) — сохраняем их пропорции внутри остатка.
+            let base = [
+                ("NO ANSWER", 0.12),
+                ("BUSY", 0.04),
+                ("FAILED", 0.015),
+                ("CONGESTION", 0.005),
+            ];
+            let base_sum: f64 = base.iter().map(|(_, w)| w).sum();
+            let mut dispositions = HashMap::new();
+            dispositions.insert("ANSWERED".to_string(), sr);
+            for (name, w) in base {
+                let share = if base_sum > 0.0 { w / base_sum } else { 0.0 };
+                dispositions.insert(name.to_string(), fail_share * share);
+            }
+            config.call_dispositions = dispositions;
+        }
+        if let Some(sms) = &events.sms {
+            config.sms_delivery_success_rate = Some(sms.delivery_success_rate);
+        }
+        if let Some(data) = &events.data {
+            let up = &data.volume_uplink.distribution.params;
+            config.data_volume_uplink = Some((up.mu, up.sigma, data.volume_uplink.min_bytes));
+            let down = &data.volume_downlink.distribution.params;
+            config.data_volume_downlink = Some((down.mu, down.sigma, data.volume_downlink.min_bytes));
         }
     }
 }

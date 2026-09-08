@@ -18,8 +18,75 @@ pub struct ContourConfig {
     pub meta: MetaSection,
     pub network: NetworkSection,
     pub subscribers: SubscribersSection,
-    // Остальные топ-уровневые секции (events, anomalies, special_events,
+    // events.voice.success_rate/events.sms.delivery_success_rate — читаем
+    // типизированно (эта правка): доля несостоявшихся звонков/недоставленных
+    // SMS напрямую задаёт асимметрию mo_call/mt_call (см. README, «известное
+    // ограничение»). Остальное внутри events (duration/failure_causes/data.*)
+    // и остальные топ-уровневые секции (anomalies, special_events,
     // vendor_extensions, interactive_overrides) — вне области этапа.
+    #[serde(default)]
+    pub events: Option<EventsSection>,
+    #[serde(flatten)]
+    pub _rest: HashMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EventsSection {
+    #[serde(default)]
+    pub voice: Option<VoiceEventsCfg>,
+    #[serde(default)]
+    pub sms: Option<SmsEventsCfg>,
+    #[serde(default)]
+    pub data: Option<DataEventsCfg>,
+    #[serde(flatten)]
+    pub _rest: HashMap<String, serde_yaml::Value>,
+}
+
+/// `events.data.volume_uplink`/`volume_downlink` — объём data-сессии
+/// читаем типизированно (эта правка): раньше объём разыгрывался по
+/// зашитой в generators.rs таблице средних на RAT (Normal, 1-12 МБ), а не
+/// по lognormal из конфига (mu/sigma по конфигу демо — 10.4/12.5, sigma
+/// 0.8) — прямая причина укороченного вывода (см. README, −28.6% байт).
+/// `profile_volume_multipliers` остаётся вне области: у rust-`Subscriber`
+/// нет поля профиля на уровне генерации data-сессии (это отдельная работа).
+#[derive(Debug, Deserialize)]
+pub struct DataEventsCfg {
+    pub volume_uplink: LognormalVolumeCfg,
+    pub volume_downlink: LognormalVolumeCfg,
+    #[serde(flatten)]
+    pub _rest: HashMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LognormalVolumeCfg {
+    pub distribution: LognormalDistCfg,
+    #[serde(default)]
+    pub min_bytes: f64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LognormalDistCfg {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    pub params: LognormalParamsCfg,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LognormalParamsCfg {
+    pub mu: f64,
+    pub sigma: f64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VoiceEventsCfg {
+    pub success_rate: f64,
+    #[serde(flatten)]
+    pub _rest: HashMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SmsEventsCfg {
+    pub delivery_success_rate: f64,
     #[serde(flatten)]
     pub _rest: HashMap<String, serde_yaml::Value>,
 }
@@ -115,7 +182,15 @@ pub struct SubscribersSection {
     // только суточные интенсивности и веса профилей.
     #[serde(default)]
     pub profiles: Vec<ProfileCfg>,
-    // imsi_prefix/msisdn_prefix/contact_book/external_numbers — вне области.
+    // Книга контактов и пул внешних номеров — читаем типизированно (этой
+    // правкой): они напрямую задают, к кому уходят звонки/SMS абонента
+    // (EXTERNAL_CALL_RATIO и параметры Zipf были зашиты в contact_book.rs
+    // независимо от того, что написано здесь).
+    #[serde(default)]
+    pub contact_book: Option<ContactBookCfg>,
+    #[serde(default)]
+    pub external_numbers: Option<ExternalNumbersCfg>,
+    // imsi_prefix/msisdn_prefix — вне области.
     #[serde(flatten)]
     pub _rest: HashMap<String, serde_yaml::Value>,
 }
@@ -125,6 +200,68 @@ impl SubscribersSection {
     pub fn profile_names(&self) -> Vec<String> {
         self.profiles.iter().map(|p| p.name.clone()).collect()
     }
+}
+
+/// `subscribers.contact_book` контурного YAML — параметры постоянной книги
+/// контактов (`degree_distribution` — только `zipf`, других типов конфиг
+/// контура не задаёт; `asymmetric`/`intra_profile_bias` пока не читаем —
+/// это отдельная работа за пределами этой правки, применяется только то,
+/// что напрямую объясняет измеренные расхождения: степень круга и доля
+/// внешних/повторных звонков).
+#[derive(Debug, Deserialize, Clone)]
+pub struct ContactBookCfg {
+    #[serde(default)]
+    pub avg_contacts: f64,
+    pub degree_distribution: DegreeDistributionCfg,
+    #[serde(default)]
+    pub repeat_call_probability: f64,
+    pub external_call_ratio: f64,
+    // asymmetric/intra_profile_bias — вне области этой правки.
+    #[serde(flatten)]
+    pub _rest: HashMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DegreeDistributionCfg {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    pub params: DegreeParamsCfg,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DegreeParamsCfg {
+    #[serde(default = "default_zipf_a")]
+    pub a: f64,
+    pub min: usize,
+    pub max: usize,
+}
+
+fn default_zipf_a() -> f64 {
+    2.0
+}
+
+/// `subscribers.external_numbers` — пул номеров "на сторону". `count`
+/// в rust не используется впрямую (пул генерируется по требуемым парам
+/// на лету, как и раньше), но `prefixes` со своими весами — используется:
+/// раньше внешний номер собирался из равновероятного списка префиксов
+/// без веса, теперь веса из конфига учитываются.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ExternalNumbersCfg {
+    #[serde(default)]
+    pub count: usize,
+    #[serde(default)]
+    pub prefixes: Vec<ExternalPrefixCfg>,
+    #[serde(flatten)]
+    pub _rest: HashMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ExternalPrefixCfg {
+    pub prefix: String,
+    #[serde(default)]
+    pub weight: f64,
+    #[serde(default)]
+    pub label: String,
 }
 
 /// Профиль абонента (`subscribers.profiles[]` контурного YAML) — вес
